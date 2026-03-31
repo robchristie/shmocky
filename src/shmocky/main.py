@@ -111,6 +111,7 @@ def create_app() -> FastAPI:
     async def oracle_query(payload: OracleQueryRequest) -> OracleQueryResponse:
         try:
             remote_host: str | None = None
+            chatgpt_url: str | None = None
             model_strategy: str | None = None
             timeout_seconds: float | None = None
             prompt_char_limit: int | None = None
@@ -138,12 +139,14 @@ def create_app() -> FastAPI:
                         detail=f"Unknown Oracle agent '{payload.agent_id}'.",
                     )
                 remote_host = oracle_agent.remote_host
+                chatgpt_url = oracle_agent.chatgpt_url
                 model_strategy = oracle_agent.model_strategy
                 timeout_seconds = oracle_agent.timeout_seconds
                 prompt_char_limit = oracle_agent.prompt_char_limit
             return await oracle.query(
                 payload,
                 remote_host=remote_host,
+                chatgpt_url=chatgpt_url,
                 model_strategy=model_strategy,
                 timeout_seconds=timeout_seconds,
                 prompt_char_limit=prompt_char_limit,

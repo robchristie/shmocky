@@ -642,6 +642,7 @@ class WorkflowSupervisor:
             response = await self._oracle.query(
                 OracleQueryRequest(prompt=prompt),
                 remote_host=expert_agent.remote_host,
+                chatgpt_url=expert_agent.chatgpt_url,
                 model_strategy=expert_agent.model_strategy,
                 timeout_seconds=expert_agent.timeout_seconds,
                 prompt_char_limit=expert_agent.prompt_char_limit,
@@ -695,6 +696,7 @@ class WorkflowSupervisor:
             response = await self._oracle.query(
                 OracleQueryRequest(prompt=prompt),
                 remote_host=judge_agent.remote_host,
+                chatgpt_url=judge_agent.chatgpt_url,
                 model_strategy=judge_agent.model_strategy,
                 timeout_seconds=judge_agent.timeout_seconds,
                 prompt_char_limit=judge_agent.prompt_char_limit,

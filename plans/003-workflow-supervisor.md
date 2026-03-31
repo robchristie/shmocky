@@ -87,3 +87,4 @@ Frontend:
 - 2026-03-31: Added durable per-run dashboard snapshots plus history APIs and a browser run selector, so completed runs can be reopened with transcript, workflow activity, and recent protocol context intact.
 - 2026-03-31: Relaxed the Oracle judge contract from strict JSON to a labeled plain-text decision format, while keeping JSON parsing as a backward-compatible fallback.
 - 2026-03-31: Split advisory and control roles so Oracle can act as a free-text expert while a Codex judge owns workflow decisions, making cross-agent handoff observable without relying on Oracle for structured control output.
+- 2026-04-01: Added per-Oracle-agent `chatgpt_url` support so advisory runs can be directed into dedicated ChatGPT project folders instead of cluttering the main browser history.

@@ -15,6 +15,7 @@ Work in small, testable slices. Keep progress observable. If you are blocked, sa
 [agents.expert]
 provider = "oracle"
 role = "expert"
+chatgpt_url = "https://chatgpt.com/g/g-p-69cc59b46ad08191886f589993476e6f-codex/project"
 model_strategy = "current"
 timeout_seconds = 1200
 prompt_char_limit = 40000

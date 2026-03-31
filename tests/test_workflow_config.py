@@ -24,6 +24,7 @@ web_access = "live"
 [agents.expert]
 provider = "oracle"
 role = "expert"
+chatgpt_url = "https://chatgpt.com/g/g-p-69cc59b46ad08191886f589993476e6f-codex/project"
 model_strategy = "current"
 prompt_char_limit = 64000
 
@@ -56,6 +57,10 @@ max_judge_calls = 3
     assert [agent.id for agent in catalog.agents] == ["engineer", "expert", "judge"]
     assert [workflow.id for workflow in catalog.workflows] == ["plan_execute_judge"]
     assert catalog.agents[1].prompt_char_limit == 64_000
+    assert (
+        catalog.agents[1].chatgpt_url
+        == "https://chatgpt.com/g/g-p-69cc59b46ad08191886f589993476e6f-codex/project"
+    )
     assert catalog.workflows[0].expert_agent == "expert"
     assert catalog.workflows[0].plan_prompt_template
     assert catalog.workflows[0].judge_prompt_template

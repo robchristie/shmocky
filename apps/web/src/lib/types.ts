@@ -103,6 +103,7 @@ export interface AgentDefinition {
 	web_access: "disabled" | "cached" | "live" | null;
 	service_tier: "fast" | "flex" | null;
 	remote_host: string | null;
+	chatgpt_url: string | null;
 	model_strategy: "current" | "ignore" | null;
 	timeout_seconds: number | null;
 }

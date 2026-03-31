@@ -165,6 +165,7 @@ class OracleAgentConfig(BaseModel):
     startup_prompt: str | None = None
     description: str | None = None
     remote_host: str | None = None
+    chatgpt_url: str | None = None
     model_strategy: Literal["current", "ignore"] = "current"
     timeout_seconds: float | None = None
     prompt_char_limit: int | None = Field(default=None, ge=1_000, le=200_000)
@@ -184,6 +185,7 @@ class AgentDefinition(BaseModel):
     web_access: WebAccessMode | None = None
     service_tier: Literal["fast", "flex"] | None = None
     remote_host: str | None = None
+    chatgpt_url: str | None = None
     model_strategy: Literal["current", "ignore"] | None = None
     timeout_seconds: float | None = None
     prompt_char_limit: int | None = Field(default=None, ge=1_000, le=200_000)

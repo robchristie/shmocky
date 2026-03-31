@@ -87,8 +87,9 @@ The current workflow shape is intentionally narrow:
 - target directories must be repository roots or standalone directories outside the Shmocky repo by default
 
 Oracle agent definitions can also carry role-specific sidecar settings such as `remote_host`,
-`timeout_seconds`, `model_strategy`, and `prompt_char_limit`, so different judge or analyst roles
-can run with different budgets from the same `shmocky.toml`.
+`chatgpt_url`, `timeout_seconds`, `model_strategy`, and `prompt_char_limit`, so different judge or
+analyst roles can run with different budgets and dedicated ChatGPT project folders from the same
+`shmocky.toml`.
 
 The backend exposes:
 

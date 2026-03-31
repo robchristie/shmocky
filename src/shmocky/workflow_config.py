@@ -200,6 +200,7 @@ class WorkflowConfigLoader:
             "startup_prompt",
             "description",
             "remote_host",
+            "chatgpt_url",
             "model_strategy",
             "timeout_seconds",
             "prompt_char_limit",

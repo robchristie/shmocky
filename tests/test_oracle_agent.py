@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -134,3 +135,62 @@ def test_oracle_agent_enforces_per_call_prompt_limit_override(
                 prompt_char_limit=1_000,
             )
         )
+
+
+def test_oracle_agent_passes_chatgpt_url_to_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ORACLE_REMOTE_TOKEN", raising=False)
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+        def kill(self) -> None:
+            return None
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_create_subprocess_exec(
+        *command: str,
+        cwd: str | None = None,
+        stdout: object | None = None,
+        stderr: object | None = None,
+    ) -> FakeProcess:
+        captured["command"] = command
+        captured["cwd"] = cwd
+        captured["stdout"] = stdout
+        captured["stderr"] = stderr
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    agent = OracleAgent(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+            oracle_remote_token=SecretStr("secret-token"),
+        )
+    )
+    monkeypatch.setattr(agent, "_read_output", lambda path: "expert answer")
+
+    response = asyncio.run(
+        agent.query(
+            OracleQueryRequest(prompt="hello"),
+            chatgpt_url="https://chatgpt.com/g/g-p-69cc59b46ad08191886f589993476e6f-codex/project",
+        )
+    )
+
+    command = captured["command"]
+    assert isinstance(command, Sequence)
+    assert "--chatgpt-url" in command
+    assert (
+        command[command.index("--chatgpt-url") + 1]
+        == "https://chatgpt.com/g/g-p-69cc59b46ad08191886f589993476e6f-codex/project"
+    )
+    assert response.answer == "expert answer"

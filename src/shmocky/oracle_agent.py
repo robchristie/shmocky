@@ -34,6 +34,7 @@ class OracleAgent:
         request: OracleQueryRequest,
         *,
         remote_host: str | None = None,
+        chatgpt_url: str | None = None,
         model_strategy: str | None = None,
         timeout_seconds: float | None = None,
         prompt_char_limit: int | None = None,
@@ -42,6 +43,7 @@ class OracleAgent:
             return await self._run_query(
                 request,
                 remote_host=remote_host,
+                chatgpt_url=chatgpt_url,
                 model_strategy=model_strategy,
                 timeout_seconds=timeout_seconds,
                 prompt_char_limit=prompt_char_limit,
@@ -52,6 +54,7 @@ class OracleAgent:
         request: OracleQueryRequest,
         *,
         remote_host: str | None,
+        chatgpt_url: str | None,
         model_strategy: str | None,
         timeout_seconds: float | None,
         prompt_char_limit: int | None,
@@ -75,6 +78,7 @@ class OracleAgent:
         effective_remote_host = self._settings._normalize_oracle_remote_host(
             remote_host or self._settings.oracle_remote_host
         )
+        effective_chatgpt_url = chatgpt_url.strip() if chatgpt_url is not None else None
         effective_model_strategy = (
             model_strategy or self._settings.oracle_browser_model_strategy
         )
@@ -94,6 +98,8 @@ class OracleAgent:
             "--write-output",
             str(output_path),
         ]
+        if effective_chatgpt_url:
+            command.extend(["--chatgpt-url", effective_chatgpt_url])
         for path in attached_files:
             command.extend(["--file", path])
         command.extend(["-p", request.prompt])
