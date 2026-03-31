@@ -20,6 +20,7 @@ Implemented:
 - Oracle judging through a structured sidecar loop
 - pause, resume, stop, and steer controls from the browser
 - one-at-a-time Oracle consults through `POST /api/oracle/query`
+- durable per-run history snapshots with transcript and workflow activity replay
 - websocket fanout for browser observability
 - file-backed raw event persistence before projection updates
 
@@ -82,7 +83,7 @@ The current workflow shape is intentionally narrow:
 - repo-local TOML config
 - one active run at a time
 - one Codex planner or executor thread per run
-- one Oracle judge that returns strict JSON decisions
+- one optional expert advisory hop plus a Codex judge that decides whether to continue
 - target directories must be repository roots or standalone directories outside the Shmocky repo by default
 
 Oracle agent definitions can also carry role-specific sidecar settings such as `remote_host`,
@@ -92,6 +93,8 @@ can run with different budgets from the same `shmocky.toml`.
 The backend exposes:
 
 - `GET /api/workflows`
+- `GET /api/runs`
+- `GET /api/runs/{run_id}`
 - `POST /api/runs`
 - `GET /api/runs/active`
 - `POST /api/runs/active/pause`
@@ -99,7 +102,7 @@ The backend exposes:
 - `POST /api/runs/active/stop`
 - `POST /api/runs/active/steer`
 
-The browser is the primary way to use these, but the endpoints are available for smoke tests and automation.
+The browser is the primary way to use these, but the endpoints are available for smoke tests and automation. Each run now stores a durable `dashboard-snapshot.json` under `.shmocky/runs/<run-id>/`, which the UI can reopen to restore transcript, workflow activity, and recent protocol context after the live Codex session has ended.
 
 ## Oracle Sidecar
 

@@ -112,9 +112,11 @@ export interface WorkflowDefinition {
 	kind: "linear_loop";
 	planner_agent: string;
 	executor_agent: string;
+	expert_agent: string | null;
 	judge_agent: string;
 	plan_prompt_template: string;
 	execute_prompt_template: string;
+	expert_prompt_template: string | null;
 	judge_prompt_template: string;
 	max_loops: number;
 	max_runtime_minutes: number;
@@ -127,6 +129,40 @@ export interface WorkflowCatalogResponse {
 	error: string | null;
 	agents: AgentDefinition[];
 	workflows: WorkflowDefinition[];
+}
+
+export interface RunHistoryEntry {
+	id: string;
+	workflow_id: string;
+	target_dir: string;
+	status:
+		| "idle"
+		| "starting"
+		| "running"
+		| "paused"
+		| "completed"
+		| "failed"
+		| "stopped";
+	phase:
+		| "idle"
+		| "planning"
+		| "executing"
+		| "advising"
+		| "judging"
+		| "paused"
+		| "completed"
+		| "failed"
+		| "stopped";
+	started_at: string;
+	updated_at: string;
+	completed_at: string | null;
+	last_judge_decision: "continue" | "complete" | "fail" | null;
+	last_judge_summary: string | null;
+	last_error: string | null;
+}
+
+export interface RunHistoryResponse {
+	runs: RunHistoryEntry[];
 }
 
 export interface WorkflowRunState {
@@ -146,6 +182,7 @@ export interface WorkflowRunState {
 		| "idle"
 		| "planning"
 		| "executing"
+		| "advising"
 		| "judging"
 		| "paused"
 		| "completed"
@@ -161,10 +198,13 @@ export interface WorkflowRunState {
 	judge_calls: number;
 	max_judge_calls: number;
 	max_runtime_minutes: number;
+	expert_agent_id: string | null;
 	last_plan: string | null;
 	last_codex_output: string | null;
+	last_expert_assessment: string | null;
 	last_judge_decision: "continue" | "complete" | "fail" | null;
 	last_judge_summary: string | null;
+	last_continuation_prompt: string | null;
 	last_error: string | null;
 	pause_requested: boolean;
 	stop_requested: boolean;

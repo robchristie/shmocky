@@ -27,22 +27,37 @@ Plan:
 
 Carry the work forward in the repository. If you are blocked, say exactly what blocked you."""
 
-DEFAULT_JUDGE_PROMPT_TEMPLATE = """You are the workflow judge. Review the run context below and
-return strict JSON with this schema only:
+DEFAULT_EXPERT_PROMPT_TEMPLATE = """You are the workflow expert advisor. Review the run context below
+and return plain text only.
 
-{
-  "decision": "continue" | "complete" | "fail",
-  "summary": "short operator-facing summary",
-  "next_prompt": "required when decision is continue",
-  "completion_note": "optional when decision is complete",
-  "failure_reason": "optional when decision is fail"
-}
+Your job:
+- assess the current run state and the latest Codex work
+- identify the most important risks, missed opportunities, or next experiments
+- suggest what the judge should consider before deciding whether to continue
+
+Keep the response concise but specific. Free text is fine.
+
+Context:
+{judge_bundle}"""
+
+DEFAULT_JUDGE_PROMPT_TEMPLATE = """You are the workflow judge. Review the run context below and
+return plain text only in this exact labeled format:
+
+Decision: continue | complete | fail
+Summary: short operator-facing summary
+Next prompt:
+required only when Decision is continue; plain text, may be multiline
+Completion note:
+optional only when Decision is complete
+Failure reason:
+optional only when Decision is fail
 
 Rules:
-- Return JSON only.
+- Return plain text only.
 - Choose "continue" only when a single next Codex prompt would materially advance the goal.
 - Choose "complete" only when the goal appears satisfied.
 - Choose "fail" only when the run is blocked or the approach is no longer viable.
+- If you choose "continue", write a complete next Codex prompt under "Next prompt:".
 
 Context:
 {judge_bundle}"""
@@ -114,6 +129,7 @@ class WorkflowConfigLoader:
                 "id": workflow_id,
                 "plan_prompt_template": DEFAULT_PLAN_PROMPT_TEMPLATE,
                 "execute_prompt_template": DEFAULT_EXECUTE_PROMPT_TEMPLATE,
+                "expert_prompt_template": DEFAULT_EXPERT_PROMPT_TEMPLATE,
                 "judge_prompt_template": DEFAULT_JUDGE_PROMPT_TEMPLATE,
                 **raw_workflow,
             }
@@ -130,9 +146,18 @@ class WorkflowConfigLoader:
                     raise WorkflowConfigError(
                         f"Workflow '{workflow_id}' references unknown agent '{ref_name}'."
                     )
+            if workflow.expert_agent is not None and workflow.expert_agent not in agent_by_id:
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow_id}' references unknown agent '{workflow.expert_agent}'."
+                )
             planner = agent_by_id[workflow.planner_agent]
             executor = agent_by_id[workflow.executor_agent]
             judge = agent_by_id[workflow.judge_agent]
+            expert = (
+                agent_by_id[workflow.expert_agent]
+                if workflow.expert_agent is not None
+                else None
+            )
             if planner.provider != "codex" or executor.provider != "codex":
                 raise WorkflowConfigError(
                     f"Workflow '{workflow_id}' must use Codex agents for planner and executor."
@@ -141,9 +166,13 @@ class WorkflowConfigLoader:
                 raise WorkflowConfigError(
                     f"Workflow '{workflow_id}' must use the same Codex agent for planner and executor in v1."
                 )
-            if judge.provider != "oracle":
+            if judge.provider != "codex":
                 raise WorkflowConfigError(
-                    f"Workflow '{workflow_id}' must use an Oracle agent for judging."
+                    f"Workflow '{workflow_id}' must use a Codex agent for judging."
+                )
+            if expert is not None and expert.provider not in {"oracle", "codex"}:
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow_id}' uses unsupported expert provider '{expert.provider}'."
                 )
             workflows.append(workflow)
         if not workflows:

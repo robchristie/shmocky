@@ -76,7 +76,7 @@ Frontend:
 
 ## Progress Notes
 
-- 2026-03-31: Locked v1 product shape to repo-local TOML, linear loop workflows, structured Oracle judge output, local target directories, and one active run at a time.
+- 2026-03-31: Locked v1 product shape to repo-local TOML, linear loop workflows, local target directories, and one active run at a time.
 - 2026-03-31: Added backend workflow models, config loader, workflow supervisor skeleton, per-run Codex session startup, and combined workflow plus transcript dashboard state.
 - 2026-03-31: Added `shmocky.toml`, workflow APIs, SPA run launcher and controls, workflow event projection, and focused config plus supervisor tests.
 - 2026-03-31: Focused end-to-end smoke passed with a temporary one-loop workflow against a throwaway git repo, confirming Codex planning and execution plus Oracle structured completion judging.
@@ -84,3 +84,6 @@ Frontend:
 - 2026-03-31: Added target-directory isolation guards so runs reject directories inside the Shmocky repo or nested inside another git repository unless explicitly overridden.
 - 2026-03-31: Moved Oracle prompt-size policy to Oracle agent config with `prompt_char_limit` in `shmocky.toml`, while keeping the global env setting as a fallback for ad hoc Oracle queries.
 - 2026-03-31: Rebalanced the operator UI so workflow activity remains in the primary right-rail view, with the protocol stream moved behind a dedicated debug tab instead of always consuming vertical space.
+- 2026-03-31: Added durable per-run dashboard snapshots plus history APIs and a browser run selector, so completed runs can be reopened with transcript, workflow activity, and recent protocol context intact.
+- 2026-03-31: Relaxed the Oracle judge contract from strict JSON to a labeled plain-text decision format, while keeping JSON parsing as a backward-compatible fallback.
+- 2026-03-31: Split advisory and control roles so Oracle can act as a free-text expert while a Codex judge owns workflow decisions, making cross-agent handoff observable without relying on Oracle for structured control output.

@@ -11,6 +11,7 @@ from .models import (
     OracleQueryRequest,
     OracleQueryResponse,
     PromptRequest,
+    RunHistoryResponse,
     StreamEnvelope,
     WorkflowCatalogResponse,
     WorkflowRunRequest,
@@ -73,6 +74,17 @@ def create_app() -> FastAPI:
     @app.get("/api/runs/active", response_model=WorkflowRunState | None)
     async def active_run() -> WorkflowRunState | None:
         return supervisor.snapshot().state.workflow_run
+
+    @app.get("/api/runs", response_model=RunHistoryResponse)
+    async def runs_history() -> RunHistoryResponse:
+        return supervisor.runs_history()
+
+    @app.get("/api/runs/{run_id}", response_model=DashboardSnapshot)
+    async def run_snapshot(run_id: str) -> DashboardSnapshot:
+        try:
+            return supervisor.load_run_snapshot(run_id)
+        except Exception as exc:
+            raise as_http_error(exc) from exc
 
     @app.post("/api/thread/start", response_model=DashboardSnapshot)
     async def start_thread() -> DashboardSnapshot:

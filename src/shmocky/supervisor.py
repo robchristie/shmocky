@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 from collections import deque
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from .bridge import BridgeError, CodexAppServerBridge
 from .event_store import WorkflowEventStore
@@ -22,6 +24,8 @@ from .models import (
     DashboardState,
     JudgeDecision,
     OracleQueryRequest,
+    RunHistoryEntry,
+    RunHistoryResponse,
     WorkflowPhase,
     WorkflowRunStatus,
     StreamEnvelope,
@@ -59,6 +63,9 @@ class RunResources:
 
 
 class WorkflowSupervisor:
+    RUN_MANIFEST_FILENAME = "run.json"
+    RUN_SNAPSHOT_FILENAME = "dashboard-snapshot.json"
+
     def __init__(self, settings: AppSettings) -> None:
         self._settings = settings
         self._loader = WorkflowConfigLoader(settings)
@@ -72,11 +79,23 @@ class WorkflowSupervisor:
         self._bridge_task: asyncio.Task[None] | None = None
         self._bridge_queue: asyncio.Queue[StreamEnvelope] | None = None
         self._resources: RunResources | None = None
+        self._archived_snapshot: DashboardSnapshot | None = None
         self._pause_gate = asyncio.Event()
         self._pause_gate.set()
         self._last_catalog_error: str | None = None
 
     def snapshot(self) -> DashboardSnapshot:
+        if self._bridge is None and self._archived_snapshot is not None:
+            snapshot = self._archived_snapshot.model_copy(deep=True)
+            snapshot.state.connection.backend_online = True
+            snapshot.state.connection.codex_connected = False
+            snapshot.state.connection.initialized = False
+            snapshot.state.connection.app_server_pid = None
+            snapshot.state.pending_server_request = None
+            if self._run_state is not None:
+                snapshot.state.workflow_run = self._run_state.model_copy(deep=True)
+            return snapshot
+
         bridge_snapshot = self._bridge.snapshot() if self._bridge is not None else None
         bridge_state = bridge_snapshot.state if bridge_snapshot is not None else None
         workspace_root = (
@@ -118,6 +137,57 @@ class WorkflowSupervisor:
                 record.model_copy(deep=True) for record in self._recent_workflow_events
             ],
         )
+
+    def runs_history(self) -> RunHistoryResponse:
+        run_entries: list[RunHistoryEntry] = []
+        for run_dir in sorted(
+            self._settings.run_log_dir.glob("*"),
+            key=lambda path: path.name,
+            reverse=True,
+        ):
+            if not run_dir.is_dir():
+                continue
+            snapshot_path = run_dir / self.RUN_SNAPSHOT_FILENAME
+            if not snapshot_path.exists():
+                continue
+            try:
+                snapshot = DashboardSnapshot.model_validate_json(
+                    snapshot_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                continue
+            workflow_run = snapshot.state.workflow_run
+            if workflow_run is None:
+                continue
+            run_entries.append(
+                RunHistoryEntry(
+                    id=workflow_run.id,
+                    workflow_id=workflow_run.workflow_id,
+                    target_dir=workflow_run.target_dir,
+                    status=workflow_run.status,
+                    phase=workflow_run.phase,
+                    started_at=workflow_run.started_at,
+                    updated_at=workflow_run.updated_at,
+                    completed_at=workflow_run.completed_at,
+                    last_judge_decision=workflow_run.last_judge_decision,
+                    last_judge_summary=workflow_run.last_judge_summary,
+                    last_error=workflow_run.last_error,
+                )
+            )
+        return RunHistoryResponse(runs=run_entries)
+
+    def load_run_snapshot(self, run_id: str) -> DashboardSnapshot:
+        snapshot_path = self._settings.run_log_dir / run_id / self.RUN_SNAPSHOT_FILENAME
+        if not snapshot_path.exists():
+            raise WorkflowNotFoundError(f"Unknown run '{run_id}'.")
+        try:
+            return DashboardSnapshot.model_validate_json(
+                snapshot_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            raise WorkflowSupervisorError(
+                f"Stored snapshot for run '{run_id}' is unreadable."
+            ) from exc
 
     def workflows_catalog(self) -> WorkflowCatalogResponse:
         try:
@@ -187,6 +257,11 @@ class WorkflowSupervisor:
 
             agent_by_id = {agent.id: agent for agent in catalog.agents}
             codex_agent = agent_by_id[workflow.executor_agent]
+            expert_agent = (
+                agent_by_id[workflow.expert_agent]
+                if workflow.expert_agent is not None
+                else None
+            )
             judge_agent = agent_by_id[workflow.judge_agent]
 
             run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
@@ -197,6 +272,7 @@ class WorkflowSupervisor:
                 workflow_event_store=WorkflowEventStore(run_dir / "workflow-events.jsonl"),
             )
             self._resources = resources
+            self._archived_snapshot = None
             self._recent_workflow_events.clear()
             self._pause_gate.set()
             self._run_state = WorkflowRunState(
@@ -207,6 +283,7 @@ class WorkflowSupervisor:
                 status="starting",
                 phase="idle",
                 codex_agent_id=codex_agent.id,
+                expert_agent_id=expert_agent.id if expert_agent is not None else None,
                 judge_agent_id=judge_agent.id,
                 started_at=datetime.now(UTC),
                 updated_at=datetime.now(UTC),
@@ -215,17 +292,23 @@ class WorkflowSupervisor:
                 max_runtime_minutes=workflow.max_runtime_minutes,
             )
             self._write_json(
-                run_dir / "run.json",
+                run_dir / self.RUN_MANIFEST_FILENAME,
                 {
                     "runId": run_id,
                     "request": payload.model_dump(mode="json"),
                     "workflow": workflow.model_dump(mode="json"),
                     "agents": {
                         "codex": codex_agent.model_dump(mode="json"),
+                        "expert": (
+                            expert_agent.model_dump(mode="json")
+                            if expert_agent is not None
+                            else None
+                        ),
                         "judge": judge_agent.model_dump(mode="json"),
                     },
                 },
             )
+            self._persist_run_snapshot()
             await self._record_workflow_event(
                 "run_started",
                 f"Started workflow '{workflow.id}' for {target_dir}",
@@ -237,7 +320,7 @@ class WorkflowSupervisor:
             )
             await self._start_bridge(target_dir, codex_agent)
             self._run_task = asyncio.create_task(
-                self._execute_run(workflow, codex_agent, judge_agent)
+                self._execute_run(workflow, codex_agent, expert_agent, judge_agent)
             )
             await self._broadcast_state()
             return self.snapshot()
@@ -374,6 +457,7 @@ class WorkflowSupervisor:
                 envelope = await queue.get()
                 if envelope.type != "event" or envelope.event is None:
                     continue
+                self._persist_run_snapshot()
                 await self._broadcast(
                     StreamEnvelope(
                         type="event",
@@ -385,7 +469,13 @@ class WorkflowSupervisor:
         except asyncio.CancelledError:
             return
 
-    async def _execute_run(self, workflow: Any, codex_agent: Any, judge_agent: Any) -> None:
+    async def _execute_run(
+        self,
+        workflow: Any,
+        codex_agent: Any,
+        expert_agent: Any,
+        judge_agent: Any,
+    ) -> None:
         started_at = monotonic()
         try:
             await self._ensure_checkpoint("planning", "Planning with Codex.")
@@ -420,19 +510,49 @@ class WorkflowSupervisor:
                     raise WorkflowSupervisorError("Workflow run disappeared during judging.")
                 self._run_state.last_codex_output = self._clip(codex_output)
 
-                await self._ensure_checkpoint("judging", f"Oracle evaluation loop {loop_index}.")
+                expert_assessment: str | None = None
+                if expert_agent is not None and workflow.expert_prompt_template is not None:
+                    await self._ensure_checkpoint(
+                        "advising",
+                        f"Expert assessment loop {loop_index}.",
+                    )
+                    expert_bundle = await self._build_judge_bundle(
+                        codex_output,
+                        expert_assessment=None,
+                    )
+                    expert_prompt = self._render_agent_prompt(
+                        workflow.expert_prompt_template,
+                        agent=expert_agent,
+                        goal=self._run_state.goal or "",
+                        plan=plan_output,
+                        last_output=codex_output,
+                        judge_bundle=expert_bundle,
+                        expert_assessment="",
+                    )
+                    expert_assessment = await self._run_expert(expert_agent, expert_prompt)
+                    if self._run_state is None:
+                        raise WorkflowSupervisorError(
+                            "Workflow run disappeared during expert assessment."
+                        )
+                    self._run_state.last_expert_assessment = self._clip(
+                        expert_assessment,
+                        limit=8_000,
+                    )
+
+                await self._ensure_checkpoint("judging", f"Judge evaluation loop {loop_index}.")
                 await self._check_budgets(loop_index, started_at, before_judge=True)
-                judge_bundle = await self._build_judge_bundle(codex_output)
-                judge_prompt_limit = (
-                    judge_agent.prompt_char_limit or self._settings.oracle_prompt_char_limit
+                judge_bundle = await self._build_judge_bundle(
+                    codex_output,
+                    expert_assessment=expert_assessment,
                 )
-                judge_prompt = self._render_judge_prompt(
+                judge_prompt = self._render_agent_prompt(
                     workflow.judge_prompt_template,
-                    prompt_limit=judge_prompt_limit,
+                    agent=judge_agent,
                     goal=self._run_state.goal or "",
                     plan=plan_output,
                     last_output=codex_output,
                     judge_bundle=judge_bundle,
+                    expert_assessment=expert_assessment or "",
                 )
                 decision = await self._run_judge(judge_agent, judge_prompt)
                 if self._run_state is None:
@@ -440,6 +560,9 @@ class WorkflowSupervisor:
                 self._run_state.judge_calls += 1
                 self._run_state.last_judge_decision = decision.decision
                 self._run_state.last_judge_summary = decision.summary
+                self._run_state.last_continuation_prompt = (
+                    decision.next_prompt if decision.decision == "continue" else None
+                )
                 self._run_state.updated_at = datetime.now(UTC)
 
                 if decision.decision == "complete":
@@ -500,34 +623,99 @@ class WorkflowSupervisor:
             raise WorkflowSupervisorError("Codex completed the turn without an assistant message.")
         return assistant_text
 
+    async def _run_expert(self, expert_agent: Any, prompt: str) -> str:
+        if self._resources is not None:
+            self._write_json(self._resources.run_dir / "last-expert-request.json", {"prompt": prompt})
+        await self._record_workflow_event(
+            "expert_started",
+            f"Started {expert_agent.provider} expert assessment.",
+            payload={"agentId": expert_agent.id, "provider": expert_agent.provider},
+        )
+        if expert_agent.provider == "oracle":
+            response = await self._oracle.query(
+                OracleQueryRequest(prompt=prompt),
+                remote_host=expert_agent.remote_host,
+                model_strategy=expert_agent.model_strategy,
+                timeout_seconds=expert_agent.timeout_seconds,
+                prompt_char_limit=expert_agent.prompt_char_limit,
+            )
+            answer = response.answer.strip()
+            if self._resources is not None:
+                self._write_json(
+                    self._resources.run_dir / "last-expert-response.json",
+                    {
+                        "answer": answer,
+                        "provider": "oracle",
+                        "remoteHost": response.remote_host,
+                        "durationSeconds": response.duration_seconds,
+                    },
+                )
+        else:
+            answer = await self._run_aux_codex_turn(
+                expert_agent,
+                prompt,
+                event_log_subdir="expert-codex-events",
+                label="expert",
+            )
+            if self._resources is not None:
+                self._write_json(
+                    self._resources.run_dir / "last-expert-response.json",
+                    {
+                        "answer": answer,
+                        "provider": "codex",
+                    },
+                )
+        await self._record_workflow_event(
+            "expert_completed",
+            f"Completed {expert_agent.provider} expert assessment.",
+            payload={
+                "agentId": expert_agent.id,
+                "provider": expert_agent.provider,
+                "answer": self._clip(answer, limit=2_000),
+            },
+        )
+        return answer
+
     async def _run_judge(self, judge_agent: Any, prompt: str) -> JudgeDecision:
         if self._resources is not None:
             self._write_json(self._resources.run_dir / "last-judge-request.json", {"prompt": prompt})
         await self._record_workflow_event(
             "judge_started",
-            "Started Oracle evaluation.",
+            f"Started {judge_agent.provider} judge evaluation.",
+            payload={"agentId": judge_agent.id, "provider": judge_agent.provider},
         )
-        response = await self._oracle.query(
-            OracleQueryRequest(prompt=prompt),
-            remote_host=judge_agent.remote_host,
-            model_strategy=judge_agent.model_strategy,
-            timeout_seconds=judge_agent.timeout_seconds,
-            prompt_char_limit=judge_agent.prompt_char_limit,
-        )
-        raw_answer = response.answer.strip()
-        if self._resources is not None:
-            self._write_json(
-                self._resources.run_dir / "last-judge-response.json",
-                {
-                    "answer": raw_answer,
-                    "remoteHost": response.remote_host,
-                    "durationSeconds": response.duration_seconds,
-                },
+        if judge_agent.provider == "oracle":
+            response = await self._oracle.query(
+                OracleQueryRequest(prompt=prompt),
+                remote_host=judge_agent.remote_host,
+                model_strategy=judge_agent.model_strategy,
+                timeout_seconds=judge_agent.timeout_seconds,
+                prompt_char_limit=judge_agent.prompt_char_limit,
             )
-        decision = JudgeDecision.model_validate_json(self._extract_json(raw_answer))
+            raw_answer = response.answer.strip()
+            response_payload: dict[str, object] = {
+                "answer": raw_answer,
+                "provider": "oracle",
+                "remoteHost": response.remote_host,
+                "durationSeconds": response.duration_seconds,
+            }
+        else:
+            raw_answer = await self._run_aux_codex_turn(
+                judge_agent,
+                prompt,
+                event_log_subdir="judge-codex-events",
+                label="judge",
+            )
+            response_payload = {
+                "answer": raw_answer,
+                "provider": "codex",
+            }
+        if self._resources is not None:
+            self._write_json(self._resources.run_dir / "last-judge-response.json", response_payload)
+        decision = self._parse_judge_decision(raw_answer)
         await self._record_workflow_event(
             "judge_completed",
-            f"Oracle returned '{decision.decision}'.",
+            f"{judge_agent.provider} returned '{decision.decision}'.",
             payload=decision.model_dump(mode="json"),
         )
         return decision
@@ -615,6 +803,7 @@ class WorkflowSupervisor:
         self._recent_workflow_events.append(record)
         if self._run_state is not None:
             self._run_state.updated_at = datetime.now(UTC)
+        self._persist_run_snapshot()
         await self._broadcast(
             StreamEnvelope(
                 type="workflow_event",
@@ -625,6 +814,7 @@ class WorkflowSupervisor:
         )
 
     async def _broadcast_state(self) -> None:
+        self._persist_run_snapshot()
         await self._broadcast(
             StreamEnvelope(
                 type="state",
@@ -644,7 +834,12 @@ class WorkflowSupervisor:
         for queue in stale:
             self._subscribers.discard(queue)
 
-    async def _build_judge_bundle(self, codex_output: str) -> str:
+    async def _build_judge_bundle(
+        self,
+        codex_output: str,
+        *,
+        expert_assessment: str | None,
+    ) -> str:
         if self._run_state is None:
             raise WorkflowSupervisorError("No workflow run exists.")
         git_status = await self._git_output("status", "--short")
@@ -660,6 +855,7 @@ class WorkflowSupervisor:
             "recentSteeringNotes": self._run_state.recent_steering_notes[-5:],
             "lastPlan": self._run_state.last_plan,
             "lastCodexOutput": self._clip(codex_output, limit=8_000),
+            "expertAssessment": self._clip(expert_assessment, limit=8_000),
             "codexLastError": (
                 bridge_snapshot.state.turn.error
                 if bridge_snapshot is not None and bridge_snapshot.state.turn is not None
@@ -675,6 +871,53 @@ class WorkflowSupervisor:
             "gitDiffExcerpt": self._clip(git_diff_excerpt, limit=8_000),
         }
         return json.dumps(payload, ensure_ascii=True, indent=2)
+
+    async def _run_aux_codex_turn(
+        self,
+        agent: Any,
+        prompt: str,
+        *,
+        event_log_subdir: str,
+        label: str,
+    ) -> str:
+        if self._run_state is None:
+            raise WorkflowSupervisorError("No workflow run exists.")
+        if self._resources is None:
+            raise WorkflowSupervisorError("No workflow resources are available.")
+        bridge = CodexAppServerBridge(
+            self._settings,
+            workspace_root=Path(self._run_state.target_dir),
+            event_log_dir=self._resources.run_dir / event_log_subdir,
+            agent_config=CodexAgentConfig(
+                role=agent.role,
+                startup_prompt=agent.startup_prompt,
+                description=agent.description,
+                model=agent.model,
+                model_provider=agent.model_provider,
+                reasoning_effort=agent.reasoning_effort,
+                approval_policy=agent.approval_policy or "never",
+                sandbox_mode=agent.sandbox_mode or "workspace-write",
+                web_access=agent.web_access or "disabled",
+                service_tier=agent.service_tier,
+            ),
+        )
+        await bridge.start()
+        try:
+            snapshot = await bridge.start_turn(prompt)
+            turn = snapshot.state.turn
+            if turn is None:
+                raise WorkflowSupervisorError(f"Codex {label} did not create a turn.")
+            completed = await bridge.wait_for_turn_completion(turn.id)
+            assistant_text = self._assistant_text_for_turn(completed, turn.id)
+            if completed.state.turn and completed.state.turn.error:
+                raise WorkflowSupervisorError(completed.state.turn.error)
+            if not assistant_text:
+                raise WorkflowSupervisorError(
+                    f"Codex {label} completed the turn without an assistant message."
+                )
+            return assistant_text
+        finally:
+            await bridge.stop()
 
     async def _git_output(self, *args: str) -> str:
         if self._run_state is None:
@@ -750,12 +993,165 @@ class WorkflowSupervisor:
             raise WorkflowSupervisorError("Judge did not return a JSON object.")
         return stripped[start : end + 1]
 
+    @classmethod
+    def _parse_judge_decision(cls, raw_answer: str) -> JudgeDecision:
+        json_error: Exception | None = None
+        try:
+            payload = cls._extract_json(raw_answer)
+            try:
+                return JudgeDecision.model_validate_json(payload)
+            except ValidationError:
+                repaired = cls._repair_judge_payload(payload)
+                return JudgeDecision.model_validate(repaired)
+        except (ValidationError, WorkflowSupervisorError) as exc:
+            json_error = exc
+
+        try:
+            return cls._parse_judge_text_decision(raw_answer)
+        except ValidationError as exc:
+            raise WorkflowSupervisorError(
+                "Judge returned a malformed decision payload that could not be parsed."
+            ) from exc
+        except WorkflowSupervisorError as exc:
+            raise WorkflowSupervisorError(
+                "Judge returned a malformed decision payload that could not be parsed."
+            ) from (json_error or exc)
+
+    @classmethod
+    def _repair_judge_payload(cls, payload: str) -> dict[str, object]:
+        decision_match = re.search(
+            r'"decision"\s*:\s*"(?P<decision>continue|complete|fail)"',
+            payload,
+        )
+        if decision_match is None:
+            raise WorkflowSupervisorError("Judge decision payload is missing a valid decision.")
+
+        repaired: dict[str, object] = {"decision": decision_match.group("decision")}
+        for field_name in (
+            "summary",
+            "next_prompt",
+            "completion_note",
+            "failure_reason",
+        ):
+            field_value = cls._extract_string_field(payload, field_name)
+            if field_value is not None:
+                repaired[field_name] = field_value
+        return repaired
+
+    @classmethod
+    def _parse_judge_text_decision(cls, raw_answer: str) -> JudgeDecision:
+        text = cls._strip_code_fence(raw_answer)
+        sections = cls._extract_judge_text_sections(text)
+        if "decision" not in sections:
+            raise WorkflowSupervisorError("Judge text response is missing a Decision section.")
+        if "summary" not in sections:
+            raise WorkflowSupervisorError("Judge text response is missing a Summary section.")
+
+        payload: dict[str, object] = {
+            "decision": sections["decision"].strip().lower(),
+            "summary": sections["summary"].strip(),
+        }
+        section_map = {
+            "next prompt": "next_prompt",
+            "completion note": "completion_note",
+            "failure reason": "failure_reason",
+        }
+        for section_name, field_name in section_map.items():
+            value = sections.get(section_name)
+            if value:
+                payload[field_name] = value.strip()
+        return JudgeDecision.model_validate(payload)
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        stripped = text.strip()
+        if not stripped.startswith("```"):
+            return stripped
+        lines = stripped.splitlines()
+        if not lines:
+            return stripped
+        body_lines = lines[1:]
+        if body_lines and body_lines[-1].strip() == "```":
+            body_lines = body_lines[:-1]
+        return "\n".join(body_lines).strip()
+
+    @staticmethod
+    def _extract_judge_text_sections(text: str) -> dict[str, str]:
+        pattern = re.compile(
+            r"(?im)^(Decision|Summary|Next prompt|Completion note|Failure reason)\s*:\s*"
+        )
+        matches = list(pattern.finditer(text))
+        if not matches:
+            raise WorkflowSupervisorError("Judge text response does not use the expected labels.")
+
+        sections: dict[str, str] = {}
+        for index, match in enumerate(matches):
+            section_name = match.group(1).lower()
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            sections[section_name] = text[start:end].strip()
+        return sections
+
+    @staticmethod
+    def _extract_string_field(payload: str, field_name: str) -> str | None:
+        key = f'"{field_name}"'
+        key_index = payload.find(key)
+        if key_index == -1:
+            return None
+        colon_index = payload.find(":", key_index + len(key))
+        if colon_index == -1:
+            return None
+        value_index = colon_index + 1
+        while value_index < len(payload) and payload[value_index].isspace():
+            value_index += 1
+        if value_index >= len(payload):
+            return None
+        if payload.startswith("null", value_index):
+            return None
+        if payload[value_index] != '"':
+            return None
+
+        value_chars: list[str] = []
+        index = value_index + 1
+        while index < len(payload):
+            char = payload[index]
+            if char == "\\" and index + 1 < len(payload):
+                value_chars.append(char)
+                value_chars.append(payload[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                lookahead = index + 1
+                while lookahead < len(payload) and payload[lookahead].isspace():
+                    lookahead += 1
+                if lookahead >= len(payload) or payload[lookahead] in {",", "}"}:
+                    try:
+                        return json.loads('"' + "".join(value_chars) + '"')
+                    except json.JSONDecodeError:
+                        return "".join(value_chars)
+            value_chars.append(char)
+            index += 1
+        return None
+
     @staticmethod
     def _render_template(template: str, **values: str) -> str:
         rendered = template
         for key, value in values.items():
             rendered = rendered.replace("{" + key + "}", value)
         return rendered
+
+    @classmethod
+    def _render_agent_prompt(
+        cls,
+        template: str,
+        *,
+        agent: Any,
+        **values: str,
+    ) -> str:
+        if agent.provider == "oracle":
+            prompt_limit = agent.prompt_char_limit or 20_000
+            return cls._render_judge_prompt(template, prompt_limit=prompt_limit, **values)
+        return cls._render_template(template, **values)
 
     @classmethod
     def _render_judge_prompt(
@@ -800,6 +1196,18 @@ class WorkflowSupervisor:
     def _write_json(path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    def _persist_run_snapshot(self) -> None:
+        if self._resources is None:
+            return
+        snapshot = self.snapshot()
+        snapshot_path = self._resources.run_dir / self.RUN_SNAPSHOT_FILENAME
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_path.write_text(
+            snapshot.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        self._archived_snapshot = snapshot.model_copy(deep=True)
 
 
 def as_http_error(error: Exception) -> HTTPException:

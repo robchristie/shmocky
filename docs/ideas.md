@@ -5,4 +5,5 @@
 
 test task
 
+/nvme/development/testing/btc
 Implement a CPU based Bitcoin hash solver. Create a benchmark framework to test your implementation against. Try to make it run as fast as possible.

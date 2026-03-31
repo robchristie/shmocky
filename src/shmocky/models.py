@@ -36,6 +36,7 @@ type WorkflowPhase = Literal[
     "idle",
     "planning",
     "executing",
+    "advising",
     "judging",
     "paused",
     "completed",
@@ -193,9 +194,11 @@ class WorkflowDefinition(BaseModel):
     kind: WorkflowKind = "linear_loop"
     planner_agent: str
     executor_agent: str
+    expert_agent: str | None = None
     judge_agent: str
     plan_prompt_template: str
     execute_prompt_template: str
+    expert_prompt_template: str | None = None
     judge_prompt_template: str
     max_loops: int = Field(default=4, ge=1, le=100)
     max_runtime_minutes: int = Field(default=30, ge=1, le=24 * 60)
@@ -208,6 +211,24 @@ class WorkflowCatalogResponse(BaseModel):
     error: str | None = None
     agents: list[AgentDefinition] = Field(default_factory=list)
     workflows: list[WorkflowDefinition] = Field(default_factory=list)
+
+
+class RunHistoryEntry(BaseModel):
+    id: str
+    workflow_id: str
+    target_dir: str
+    status: WorkflowRunStatus
+    phase: WorkflowPhase
+    started_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    last_judge_decision: WorkflowDecisionType | None = None
+    last_judge_summary: str | None = None
+    last_error: str | None = None
+
+
+class RunHistoryResponse(BaseModel):
+    runs: list[RunHistoryEntry] = Field(default_factory=list)
 
 
 class WorkflowRunRequest(BaseModel):
@@ -245,10 +266,13 @@ class WorkflowRunState(BaseModel):
     judge_calls: int = 0
     max_judge_calls: int
     max_runtime_minutes: int
+    expert_agent_id: str | None = None
     last_plan: str | None = None
     last_codex_output: str | None = None
+    last_expert_assessment: str | None = None
     last_judge_decision: WorkflowDecisionType | None = None
     last_judge_summary: str | None = None
+    last_continuation_prompt: str | None = Field(default=None, max_length=20_000)
     last_error: str | None = None
     pause_requested: bool = False
     stop_requested: bool = False

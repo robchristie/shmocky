@@ -7,6 +7,8 @@ import type {
 	DashboardSnapshot,
 	DashboardState,
 	RawEventRecord,
+	RunHistoryEntry,
+	RunHistoryResponse,
 	StreamEnvelope,
 	WorkflowCatalogResponse,
 	WorkflowDefinition,
@@ -29,9 +31,12 @@ let dashboardState: DashboardState | null = $state(null);
 let workflowCatalog: WorkflowCatalogResponse | null = $state(null);
 let recentEvents: RawEventRecord[] = $state([]);
 let recentWorkflowEvents: WorkflowEventRecord[] = $state([]);
+let runHistory: RunHistoryEntry[] = $state([]);
+let historicalSnapshot: DashboardSnapshot | null = $state(null);
 let loading = $state(true);
 let requestError: string | null = $state(null);
 let socketState: "connecting" | "open" | "closed" = $state("connecting");
+let selectedRunView = $state("live");
 let selectedWorkflowId = $state("");
 let targetDir = $state("");
 let startPrompt = $state("");
@@ -66,7 +71,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function activeRun() {
+	return viewedState()?.workflow_run ?? null;
+}
+
+function liveRun() {
 	return dashboardState?.workflow_run ?? null;
+}
+
+function viewedState(): DashboardState | null {
+	return historicalSnapshot?.state ?? dashboardState;
+}
+
+function viewedRecentEvents(): RawEventRecord[] {
+	return historicalSnapshot?.recent_events ?? recentEvents;
+}
+
+function viewedRecentWorkflowEvents(): WorkflowEventRecord[] {
+	return historicalSnapshot?.recent_workflow_events ?? recentWorkflowEvents;
 }
 
 function applySnapshot(snapshot: DashboardSnapshot) {
@@ -90,6 +111,14 @@ function applyEnvelope(payload: StreamEnvelope | DashboardSnapshot) {
 				...recentWorkflowEvents,
 				payload.workflow_event,
 			].slice(-200);
+			if (
+				payload.workflow_event.kind === "run_started" ||
+				payload.workflow_event.kind === "run_completed" ||
+				payload.workflow_event.kind === "run_failed" ||
+				payload.workflow_event.kind === "run_stopped"
+			) {
+				void refreshRuns();
+			}
 		}
 		return;
 	}
@@ -118,6 +147,32 @@ async function refreshWorkflows() {
 	}
 }
 
+async function refreshRuns() {
+	try {
+		const response = await request<RunHistoryResponse>("/api/runs");
+		runHistory = response.runs;
+	} catch (error) {
+		requestError = toErrorMessage(error);
+	}
+}
+
+async function selectRunView(runId: string) {
+	selectedRunView = runId;
+	if (runId === "live") {
+		historicalSnapshot = null;
+		requestError = null;
+		return;
+	}
+	try {
+		historicalSnapshot = await request<DashboardSnapshot>(
+			`/api/runs/${encodeURIComponent(runId)}`,
+		);
+		requestError = null;
+	} catch (error) {
+		requestError = toErrorMessage(error);
+	}
+}
+
 async function startWorkflowRun() {
 	if (!selectedWorkflowId || !targetDir.trim() || !startPrompt.trim()) {
 		return;
@@ -135,6 +190,7 @@ async function startWorkflowRun() {
 		applySnapshot(snapshot);
 		startPrompt = "";
 		steerNote = "";
+		await refreshRuns();
 	} catch (error) {
 		requestError = toErrorMessage(error);
 	} finally {
@@ -431,12 +487,12 @@ function rawEventStream(events: RawEventRecord[]): EventStreamEntry[] {
 
 function eventStreamEntries() {
 	if (eventStreamMode === "raw") {
-		return rawEventStream(recentEvents);
+		return rawEventStream(viewedRecentEvents());
 	}
 	if (eventStreamMode === "important") {
-		return coalesceEventStream(recentEvents.filter(isImportantEvent));
+		return coalesceEventStream(viewedRecentEvents().filter(isImportantEvent));
 	}
-	return coalesceEventStream(recentEvents);
+	return coalesceEventStream(viewedRecentEvents());
 }
 
 function summarizeWorkflowEvent(event: WorkflowEventRecord) {
@@ -484,12 +540,21 @@ function codexConnected() {
 }
 
 function workflowActive() {
-	const status = activeRun()?.status;
+	const status = liveRun()?.status;
 	return status === "starting" || status === "running" || status === "paused";
 }
 
 function workflowPaused() {
-	return activeRun()?.status === "paused";
+	return liveRun()?.status === "paused";
+}
+
+function stoppedOnLoopBudget() {
+	const run = activeRun();
+	return (
+		run?.status === "failed" &&
+		typeof run.last_error === "string" &&
+		run.last_error.startsWith("Workflow loop budget exceeded")
+	);
 }
 
 function selectedWorkflow(): WorkflowDefinition | null {
@@ -501,7 +566,7 @@ function selectedWorkflow(): WorkflowDefinition | null {
 }
 
 $effect(() => {
-	const transcriptCount = dashboardState?.transcript.length ?? 0;
+	const transcriptCount = viewedState()?.transcript.length ?? 0;
 	void transcriptCount;
 	void tick().then(() => {
 		if (transcriptPane && autoScrollTranscript) {
@@ -511,7 +576,7 @@ $effect(() => {
 });
 
 $effect(() => {
-	const workflowEventCount = recentWorkflowEvents.length;
+	const workflowEventCount = viewedRecentWorkflowEvents().length;
 	void workflowEventCount;
 	void tick().then(() => {
 		if (workflowPane && autoScrollWorkflowEvents) {
@@ -521,7 +586,7 @@ $effect(() => {
 });
 
 $effect(() => {
-	const eventCount = recentEvents.length;
+	const eventCount = viewedRecentEvents().length;
 	void eventCount;
 	void eventStreamMode;
 	void tick().then(() => {
@@ -534,6 +599,7 @@ $effect(() => {
 onMount(() => {
 	void refreshState();
 	void refreshWorkflows();
+	void refreshRuns();
 	connectStream();
 	return () => {
 		stopReconnect();
@@ -548,7 +614,7 @@ onMount(() => {
 			<div class="flex min-w-0 flex-col gap-1">
 				<div class="text-[1rem] font-medium tracking-[-0.02em]">Shmocky</div>
 				<div class="min-w-0 truncate text-[0.83rem] text-muted-foreground">
-					{activeRun()?.target_dir ?? dashboardState?.workspace_root ?? "/nvme/development/shmocky"}
+					{activeRun()?.target_dir ?? viewedState()?.workspace_root ?? "/nvme/development/shmocky"}
 				</div>
 			</div>
 			<div class="flex flex-wrap items-center gap-5 text-[0.76rem] text-muted-foreground">
@@ -575,12 +641,12 @@ onMount(() => {
 				<div class="flex items-center gap-2">
 					<span>workflow</span>
 					<span class="text-foreground">
-						{humanizeStatus(activeRun()?.status ?? (workflowCatalog?.loaded ? "idle" : "config error"))}
+						{humanizeStatus(liveRun()?.status ?? activeRun()?.status ?? (workflowCatalog?.loaded ? "idle" : "config error"))}
 					</span>
 				</div>
 				<div class="flex items-center gap-2">
 					<span>phase</span>
-					<span class="text-foreground">{humanizeStatus(activeRun()?.phase)}</span>
+					<span class="text-foreground">{humanizeStatus(liveRun()?.phase ?? activeRun()?.phase)}</span>
 				</div>
 				<div class="flex items-center gap-2">
 					<span>stream</span>
@@ -600,6 +666,20 @@ onMount(() => {
 					</div>
 				</div>
 				<div class="flex flex-wrap items-center gap-2">
+					<select
+						bind:value={selectedRunView}
+						class="h-8 rounded-md border border-border bg-background px-2 text-[0.76rem] outline-none ring-0"
+						onchange={(event) => {
+							void selectRunView((event.currentTarget as HTMLSelectElement).value);
+						}}
+					>
+						<option value="live">Current view</option>
+						{#each runHistory as run}
+							<option value={run.id}>
+								{run.workflow_id} · {formatShortDateTime(run.started_at)} · {humanizeStatus(run.status)}
+							</option>
+						{/each}
+					</select>
 					<Button variant="outline" size="sm" onclick={refreshState}>Refresh</Button>
 					<Button
 						variant="outline"
@@ -635,12 +715,16 @@ onMount(() => {
 			>
 				{#if loading}
 					<div class="px-5 py-6 text-[0.85rem] text-muted-foreground">Loading session state…</div>
-				{:else if !dashboardState?.transcript.length}
+				{:else if !viewedState()?.transcript.length}
 					<div class="px-5 py-6 text-[0.85rem] text-muted-foreground">
-						Launch a workflow run from the right rail to start the Codex transcript.
+						{#if selectedRunView === "live"}
+							Launch a workflow run from the right rail to start the Codex transcript.
+						{:else}
+							This stored run does not have any transcript items.
+						{/if}
 					</div>
 				{:else}
-					{#each dashboardState.transcript as item (item.item_id)}
+					{#each viewedState()?.transcript ?? [] as item (item.item_id)}
 						<div
 							transition:fade={{ duration: 120 }}
 							class="grid grid-cols-[4.6rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-4"
@@ -682,10 +766,10 @@ onMount(() => {
 							<div class="text-[0.74rem] text-muted-foreground">
 								{#if requestError}
 									{requestError}
-								{:else if activeRun()?.pause_requested}
+								{:else if liveRun()?.pause_requested}
 									Pause requested; the run will pause after the current step.
-								{:else if activeRun()?.pending_steering_notes.length}
-									{activeRun()?.pending_steering_notes.length} steering note(s) queued.
+								{:else if liveRun()?.pending_steering_notes.length}
+									{liveRun()?.pending_steering_notes.length} steering note(s) queued.
 								{:else}
 									Steering applies on the next Codex execution step.
 								{/if}
@@ -713,15 +797,15 @@ onMount(() => {
 				<div class="mt-3 grid gap-2 text-[0.78rem]">
 					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">Codex model</div>
-						<div class="truncate">{dashboardState?.thread?.model ?? "—"}</div>
+						<div class="truncate">{viewedState()?.thread?.model ?? "—"}</div>
 					</div>
 					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">Sandbox</div>
-						<div class="truncate">{dashboardState?.thread?.sandbox_mode ?? "—"}</div>
+						<div class="truncate">{viewedState()?.thread?.sandbox_mode ?? "—"}</div>
 					</div>
 					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">Approvals</div>
-						<div class="truncate">{dashboardState?.thread?.approval_policy ?? "—"}</div>
+						<div class="truncate">{viewedState()?.thread?.approval_policy ?? "—"}</div>
 					</div>
 					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">Loop</div>
@@ -740,7 +824,7 @@ onMount(() => {
 					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">MCP</div>
 						<div class="truncate">
-							{Object.entries(dashboardState?.mcp_servers ?? {})
+							{Object.entries(viewedState()?.mcp_servers ?? {})
 								.map(([name, status]) => `${name}:${status}`)
 								.join(", ") || "—"}
 						</div>
@@ -750,9 +834,25 @@ onMount(() => {
 							{activeRun()?.last_judge_decision}: {activeRun()?.last_judge_summary}
 						</div>
 					{/if}
+					{#if activeRun()?.last_expert_assessment}
+						<div class="border-t border-border pt-3">
+							<div class="text-[0.72rem] text-muted-foreground">Expert assessment</div>
+							<div class="mt-2 whitespace-pre-wrap rounded-md border border-border px-3 py-3 text-[0.75rem] leading-6 text-foreground">
+								{activeRun()?.last_expert_assessment}
+							</div>
+						</div>
+					{/if}
 					{#if activeRun()?.last_error}
 						<div class="border-t border-border pt-2 text-[0.74rem] text-[#c97c6b]">
 							{activeRun()?.last_error}
+						</div>
+					{/if}
+					{#if stoppedOnLoopBudget() && activeRun()?.last_continuation_prompt}
+						<div class="border-t border-border pt-3">
+							<div class="text-[0.72rem] text-muted-foreground">Continuation prompt</div>
+							<div class="mt-2 whitespace-pre-wrap rounded-md border border-border px-3 py-3 text-[0.75rem] leading-6 text-foreground">
+								{activeRun()?.last_continuation_prompt}
+							</div>
 						</div>
 					{/if}
 				</div>
@@ -897,6 +997,10 @@ onMount(() => {
 										<div class="truncate text-foreground">{selectedWorkflow()?.planner_agent}</div>
 									</div>
 									<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+										<div>Expert</div>
+										<div class="truncate text-foreground">{selectedWorkflow()?.expert_agent ?? "—"}</div>
+									</div>
+									<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 										<div>Judge</div>
 										<div class="truncate text-foreground">{selectedWorkflow()?.judge_agent}</div>
 									</div>
@@ -919,12 +1023,12 @@ onMount(() => {
 						class="min-h-0 overflow-y-auto"
 						onscroll={() => updateScrollMode("workflow")}
 					>
-						{#if !recentWorkflowEvents.length}
+						{#if !viewedRecentWorkflowEvents().length}
 							<div class="px-5 py-6 text-[0.82rem] text-muted-foreground">
 								No workflow events captured yet.
 							</div>
 						{:else}
-							{#each recentWorkflowEvents as event (event.event_id)}
+							{#each viewedRecentWorkflowEvents() as event (event.event_id)}
 								<div
 									transition:fade={{ duration: 120 }}
 									class="grid grid-cols-[5rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-3"

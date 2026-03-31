@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from shmocky.models import (
+    ConnectionState,
+    DashboardSnapshot,
+    DashboardState,
+    WorkflowRunState,
+)
 from shmocky.settings import AppSettings
 from shmocky.supervisor import WorkflowSupervisor, WorkflowSupervisorError
 
@@ -21,6 +28,39 @@ def test_supervisor_extract_json_from_fenced_answer() -> None:
     )
 
     assert '"decision": "continue"' in payload
+
+
+def test_supervisor_repairs_judge_payload_with_unescaped_quotes_in_next_prompt() -> None:
+    decision = WorkflowSupervisor._parse_judge_decision(
+        '{"decision":"continue","summary":"Need one more step.",'
+        '"next_prompt":"Preserve "lowest winning nonce" semantics while tuning chunk sizing."}'
+    )
+
+    assert decision.decision == "continue"
+    assert decision.summary == "Need one more step."
+    assert (
+        decision.next_prompt
+        == 'Preserve "lowest winning nonce" semantics while tuning chunk sizing.'
+    )
+
+
+def test_supervisor_parses_labeled_text_judge_response() -> None:
+    decision = WorkflowSupervisor._parse_judge_decision(
+        """Decision: continue
+Summary: Need one more implementation slice.
+Next prompt:
+Continue from the current repository state.
+
+Focus on benchmark realism and preserve correctness.
+"""
+    )
+
+    assert decision.decision == "continue"
+    assert decision.summary == "Need one more implementation slice."
+    assert decision.next_prompt == (
+        "Continue from the current repository state.\n\n"
+        "Focus on benchmark realism and preserve correctness."
+    )
 
 
 def test_supervisor_render_template_preserves_literal_json_braces() -> None:
@@ -119,3 +159,128 @@ judge_agent = "judge"
         match="nested inside another git repository",
     ):
         supervisor._validate_target_dir(target_dir)
+
+
+def test_supervisor_lists_and_loads_persisted_run_snapshots(tmp_path: Path) -> None:
+    run_dir = tmp_path / ".shmocky" / "runs" / "20260331T120000Z-abcdef12"
+    run_dir.mkdir(parents=True)
+    started_at = datetime(2026, 3, 31, 12, 0, tzinfo=UTC)
+    snapshot = DashboardSnapshot(
+        state=DashboardState(
+            workspace_root=str(tmp_path / "repo"),
+            event_log_path=str(run_dir / "codex-events" / "events.jsonl"),
+            connection=ConnectionState(backend_online=True, codex_connected=False),
+            workflow_run=WorkflowRunState(
+                id="20260331T120000Z-abcdef12",
+                workflow_id="plan_execute_judge",
+                target_dir=str(tmp_path / "repo"),
+                goal="Ship the feature.",
+                status="completed",
+                phase="completed",
+                codex_agent_id="engineer",
+                judge_agent_id="judge",
+                started_at=started_at,
+                updated_at=started_at,
+                completed_at=started_at,
+                max_loops=4,
+                max_judge_calls=4,
+                max_runtime_minutes=45,
+                last_judge_decision="complete",
+                last_judge_summary="Done.",
+            ),
+        ),
+        recent_events=[],
+        recent_workflow_events=[],
+    )
+    (run_dir / WorkflowSupervisor.RUN_SNAPSHOT_FILENAME).write_text(
+        snapshot.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            run_log_dir=tmp_path / ".shmocky" / "runs",
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+
+    history = supervisor.runs_history()
+    loaded = supervisor.load_run_snapshot("20260331T120000Z-abcdef12")
+
+    assert [entry.id for entry in history.runs] == ["20260331T120000Z-abcdef12"]
+    assert history.runs[0].last_judge_summary == "Done."
+    assert loaded.state.workflow_run is not None
+    assert loaded.state.workflow_run.status == "completed"
+
+
+def test_supervisor_snapshot_uses_archived_completed_run_when_bridge_is_gone(
+    tmp_path: Path,
+) -> None:
+    started_at = datetime(2026, 3, 31, 12, 0, tzinfo=UTC)
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+    supervisor._run_state = WorkflowRunState(
+        id="run-1",
+        workflow_id="plan_execute_judge",
+        target_dir=str(tmp_path / "repo"),
+        goal="Explain the run.",
+        status="failed",
+        phase="failed",
+        codex_agent_id="engineer",
+        judge_agent_id="judge",
+        started_at=started_at,
+        updated_at=started_at,
+        completed_at=started_at,
+        max_loops=4,
+        max_judge_calls=4,
+        max_runtime_minutes=45,
+        last_continuation_prompt="Run the benchmark again with the new flag.",
+        last_error="Loop budget exceeded.",
+    )
+    supervisor._archived_snapshot = DashboardSnapshot.model_validate(
+        {
+            "state": {
+                "workspace_root": str(tmp_path / "repo"),
+                "event_log_path": str(tmp_path / ".shmocky" / "events"),
+                "connection": {
+                    "backend_online": True,
+                    "codex_connected": True,
+                    "initialized": True,
+                    "app_server_pid": 123,
+                },
+                "thread": {"id": "thread-1", "status": "idle"},
+                "transcript": [
+                    {
+                        "item_id": "assistant-1",
+                        "role": "assistant",
+                        "text": "Investigated the repository.",
+                        "status": "completed",
+                        "turn_id": "turn-1",
+                    }
+                ],
+                "workflow_run": supervisor._run_state.model_dump(mode="json"),
+            },
+            "recent_events": [],
+            "recent_workflow_events": [],
+        }
+    )
+
+    snapshot = supervisor.snapshot()
+
+    assert snapshot.state.connection.codex_connected is False
+    assert snapshot.state.connection.app_server_pid is None
+    assert snapshot.state.workflow_run is not None
+    assert snapshot.state.workflow_run.last_error == "Loop budget exceeded."
+    assert (
+        snapshot.state.workflow_run.last_continuation_prompt
+        == "Run the benchmark again with the new flag."
+    )
+    assert [item.text for item in snapshot.state.transcript] == [
+        "Investigated the repository."
+    ]
