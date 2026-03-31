@@ -16,3 +16,6 @@ apps/web/build/
 
 # Local Shmocky state
 .shmocky/
+
+# API Secrets
+.env

@@ -18,6 +18,7 @@ Implemented:
 - one active workspace thread
 - prompt submission through `turn/start`
 - turn interruption through `turn/interrupt`
+- one-at-a-time Oracle consults through `POST /api/oracle/query`
 - websocket fanout for browser observability
 - file-backed raw event persistence before projection updates
 
@@ -65,6 +66,34 @@ The helper scripts in `scripts/` default to:
 Then open the Vite URL in a browser. The header should show backend and Codex connectivity,
 and the main workspace should let you start a thread, send prompts, interrupt turns, and inspect
 the raw event stream.
+
+## Oracle Sidecar
+
+Shmocky can also invoke a slow Oracle sidecar for high-value consultation work without folding it
+into the Codex control loop. The backend reads:
+
+- `ORACLE_REMOTE_TOKEN` from `.env`
+- `ORACLE_REMOTE_HOST` optionally, defaulting to `https://oracle.yutani.tech:9473`
+
+The backend normalizes URL-style remote hosts into the `host:port` format Oracle expects, so both
+`https://oracle.yutani.tech:9473` and `oracle.yutani.tech:9473` work.
+
+Query it directly through the API:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/oracle/query \
+  -H 'content-type: application/json' \
+  -d '{
+    "prompt": "Review this architecture for hidden operational risks.",
+    "files": ["README.md", "src/shmocky/**/*.py"]
+  }'
+```
+
+Notes:
+
+- Oracle calls are serialized intentionally to avoid spamming the remote signed-in browser.
+- The current slice returns the final answer only. It does not stream partial Oracle output into the UI.
+- Attached `files` are resolved relative to the workspace root and expanded from glob patterns before invocation.
 
 ## Quality Gates
 

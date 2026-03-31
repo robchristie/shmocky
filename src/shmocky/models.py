@@ -101,3 +101,16 @@ class StreamEnvelope(BaseModel):
 
 class PromptRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20_000)
+
+
+class OracleQueryRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=20_000)
+    files: list[str] = Field(default_factory=list, max_length=64)
+
+
+class OracleQueryResponse(BaseModel):
+    answer: str
+    remote_host: str
+    duration_seconds: float
+    attached_files: list[str] = Field(default_factory=list)
+    stderr: str | None = None

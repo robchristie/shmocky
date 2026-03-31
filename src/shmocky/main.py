@@ -3,17 +3,25 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from .bridge import CodexAppServerBridge
-from .models import DashboardSnapshot, PromptRequest, StreamEnvelope
+from .models import (
+    DashboardSnapshot,
+    OracleQueryRequest,
+    OracleQueryResponse,
+    PromptRequest,
+    StreamEnvelope,
+)
+from .oracle_agent import OracleAgent, OracleAgentError, OracleNotConfiguredError
 from .settings import AppSettings
 
 
 def create_app() -> FastAPI:
     settings = AppSettings()
     bridge = CodexAppServerBridge(settings)
+    oracle = OracleAgent(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -38,6 +46,8 @@ def create_app() -> FastAPI:
             "backendOnline": snapshot.state.connection.backend_online,
             "codexConnected": snapshot.state.connection.codex_connected,
             "initialized": snapshot.state.connection.initialized,
+            "oracleConfigured": oracle.is_configured(),
+            "oracleRemoteHost": settings.oracle_remote_host,
         }
 
     @app.get("/api/state", response_model=DashboardSnapshot)
@@ -55,6 +65,15 @@ def create_app() -> FastAPI:
     @app.post("/api/turns/interrupt", response_model=DashboardSnapshot)
     async def interrupt_turn() -> DashboardSnapshot:
         return await bridge.interrupt_turn()
+
+    @app.post("/api/oracle/query", response_model=OracleQueryResponse)
+    async def oracle_query(payload: OracleQueryRequest) -> OracleQueryResponse:
+        try:
+            return await oracle.query(payload)
+        except OracleNotConfiguredError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except OracleAgentError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.websocket("/api/events")
     async def events(websocket: WebSocket) -> None:
