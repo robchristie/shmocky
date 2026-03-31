@@ -17,7 +17,7 @@ provider = "oracle"
 role = "expert"
 chatgpt_url = "https://chatgpt.com/g/g-p-69cc59b46ad08191886f589993476e6f-codex/project"
 model_strategy = "current"
-timeout_seconds = 1200
+timeout_seconds = 3600
 prompt_char_limit = 40000
 startup_prompt = """
 You are the workflow expert advisor. Return plain text analysis and concrete suggestions only.

@@ -91,6 +91,11 @@ Oracle agent definitions can also carry role-specific sidecar settings such as `
 analyst roles can run with different budgets and dedicated ChatGPT project folders from the same
 `shmocky.toml`.
 
+If you switch Oracle’s browser model to slower modes such as ChatGPT Pro, raise or keep
+`timeout_seconds` accordingly. The default backend fallback is now `3600` seconds, and Oracle-agent
+failures inside workflow runs pause the run for operator intervention instead of failing it
+immediately.
+
 The backend exposes:
 
 - `GET /api/workflows`

@@ -536,11 +536,25 @@ class WorkflowSupervisor:
                         judge_bundle=expert_bundle,
                         expert_assessment="",
                     )
-                    expert_assessment = await self._run_expert(expert_agent, expert_prompt)
+                    while True:
+                        try:
+                            expert_assessment = await self._run_expert(expert_agent, expert_prompt)
+                            break
+                        except (OracleAgentError, OracleNotConfiguredError) as exc:
+                            if expert_agent.provider != "oracle":
+                                raise
+                            await self._pause_for_oracle_failure(
+                                agent_label="expert",
+                                detail=str(exc),
+                            )
                     if self._run_state is None:
                         raise WorkflowSupervisorError(
                             "Workflow run disappeared during expert assessment."
                         )
+                    if self._run_state.last_error and self._run_state.last_error.startswith(
+                        "Oracle expert failed and the run is paused:"
+                    ):
+                        self._run_state.last_error = None
                     self._run_state.last_expert_assessment = self._clip(
                         expert_assessment,
                         limit=8_000,
@@ -561,9 +575,23 @@ class WorkflowSupervisor:
                     judge_bundle=judge_bundle,
                     expert_assessment=expert_assessment or "",
                 )
-                decision = await self._run_judge(judge_agent, judge_prompt)
+                while True:
+                    try:
+                        decision = await self._run_judge(judge_agent, judge_prompt)
+                        break
+                    except (OracleAgentError, OracleNotConfiguredError) as exc:
+                        if judge_agent.provider != "oracle":
+                            raise
+                        await self._pause_for_oracle_failure(
+                            agent_label="judge",
+                            detail=str(exc),
+                        )
                 if self._run_state is None:
                     raise WorkflowSupervisorError("Workflow run disappeared after judging.")
+                if self._run_state.last_error and self._run_state.last_error.startswith(
+                    "Oracle judge failed and the run is paused:"
+                ):
+                    self._run_state.last_error = None
                 self._run_state.judge_calls += 1
                 self._run_state.last_judge_decision = decision.decision
                 self._run_state.last_judge_summary = decision.summary
@@ -751,6 +779,26 @@ class WorkflowSupervisor:
             raise WorkflowSupervisorError(
                 f"Workflow judge-call budget exceeded ({self._run_state.max_judge_calls} calls)."
             )
+
+    async def _pause_for_oracle_failure(self, *, agent_label: str, detail: str) -> None:
+        if self._run_state is None:
+            raise WorkflowSupervisorError("No workflow run exists.")
+        self._pause_gate.clear()
+        self._run_state.status = "paused"
+        self._run_state.phase = "paused"
+        self._run_state.last_error = (
+            f"Oracle {agent_label} failed and the run is paused: {detail}"
+        )
+        self._run_state.updated_at = datetime.now(UTC)
+        await self._record_workflow_event(
+            "oracle_blocked",
+            f"Oracle {agent_label} failed; run paused until operator resume.",
+            payload={"agent": agent_label, "detail": detail},
+        )
+        await self._broadcast_state()
+        await self._pause_gate.wait()
+        if self._run_state.stop_requested:
+            raise WorkflowStoppedError("Workflow stop requested.")
 
     async def _ensure_checkpoint(self, phase: WorkflowPhase, message: str) -> None:
         if self._run_state is None:

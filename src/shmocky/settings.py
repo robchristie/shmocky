@@ -43,7 +43,7 @@ class AppSettings(BaseSettings):
     )
     oracle_engine: Literal["browser"] = "browser"
     oracle_browser_model_strategy: Literal["current", "ignore"] = "current"
-    oracle_timeout_seconds: float = 1200.0
+    oracle_timeout_seconds: float = 3600.0
     oracle_prompt_char_limit: int = Field(default=20_000, ge=1_000, le=200_000)
     allowed_origins: list[str] = Field(
         default_factory=lambda: [

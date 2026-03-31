@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 import subprocess
 from pathlib import Path
@@ -287,3 +288,53 @@ def test_supervisor_snapshot_uses_archived_completed_run_when_bridge_is_gone(
     assert [item.text for item in snapshot.state.transcript] == [
         "Investigated the repository."
     ]
+
+
+def test_supervisor_pauses_and_resumes_after_oracle_failure(tmp_path: Path) -> None:
+    started_at = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+    supervisor._run_state = WorkflowRunState(
+        id="run-1",
+        run_name="oracle wait test",
+        workflow_id="plan_execute_judge",
+        target_dir=str(tmp_path),
+        goal="Keep waiting for Oracle.",
+        status="running",
+        phase="advising",
+        codex_agent_id="engineer",
+        expert_agent_id="expert",
+        judge_agent_id="judge",
+        started_at=started_at,
+        updated_at=started_at,
+        max_loops=4,
+        max_judge_calls=4,
+        max_runtime_minutes=45,
+    )
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            supervisor._pause_for_oracle_failure(
+                agent_label="expert",
+                detail="Oracle query timed out after 3600s.",
+            )
+        )
+        await asyncio.sleep(0)
+        assert supervisor._run_state is not None
+        assert supervisor._run_state.status == "paused"
+        assert supervisor._run_state.phase == "paused"
+        assert supervisor._run_state.last_error is not None
+        assert "Oracle expert failed and the run is paused" in supervisor._run_state.last_error
+
+        await supervisor.resume_run()
+        await task
+
+    asyncio.run(exercise())
+
+    assert supervisor._run_state is not None
+    assert supervisor._run_state.status == "running"
