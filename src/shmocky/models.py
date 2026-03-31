@@ -215,6 +215,7 @@ class WorkflowCatalogResponse(BaseModel):
 
 class RunHistoryEntry(BaseModel):
     id: str
+    run_name: str | None = None
     workflow_id: str
     target_dir: str
     status: WorkflowRunStatus
@@ -232,6 +233,7 @@ class RunHistoryResponse(BaseModel):
 
 
 class WorkflowRunRequest(BaseModel):
+    run_name: str | None = Field(default=None, min_length=1, max_length=200)
     workflow_id: str = Field(min_length=1, max_length=200)
     target_dir: str = Field(min_length=1, max_length=4_000)
     prompt: str = Field(min_length=1, max_length=20_000)
@@ -251,6 +253,7 @@ class JudgeDecision(BaseModel):
 
 class WorkflowRunState(BaseModel):
     id: str
+    run_name: str | None = Field(default=None, max_length=200)
     workflow_id: str
     target_dir: str
     goal: str

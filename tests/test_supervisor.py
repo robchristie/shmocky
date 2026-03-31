@@ -172,6 +172,7 @@ def test_supervisor_lists_and_loads_persisted_run_snapshots(tmp_path: Path) -> N
             connection=ConnectionState(backend_online=True, codex_connected=False),
             workflow_run=WorkflowRunState(
                 id="20260331T120000Z-abcdef12",
+                run_name="workflow testing xyz",
                 workflow_id="plan_execute_judge",
                 target_dir=str(tmp_path / "repo"),
                 goal="Ship the feature.",
@@ -209,6 +210,7 @@ def test_supervisor_lists_and_loads_persisted_run_snapshots(tmp_path: Path) -> N
     loaded = supervisor.load_run_snapshot("20260331T120000Z-abcdef12")
 
     assert [entry.id for entry in history.runs] == ["20260331T120000Z-abcdef12"]
+    assert history.runs[0].run_name == "workflow testing xyz"
     assert history.runs[0].last_judge_summary == "Done."
     assert loaded.state.workflow_run is not None
     assert loaded.state.workflow_run.status == "completed"
@@ -227,6 +229,7 @@ def test_supervisor_snapshot_uses_archived_completed_run_when_bridge_is_gone(
     )
     supervisor._run_state = WorkflowRunState(
         id="run-1",
+        run_name="named run",
         workflow_id="plan_execute_judge",
         target_dir=str(tmp_path / "repo"),
         goal="Explain the run.",

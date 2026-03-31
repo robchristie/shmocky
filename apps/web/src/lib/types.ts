@@ -133,6 +133,7 @@ export interface WorkflowCatalogResponse {
 
 export interface RunHistoryEntry {
 	id: string;
+	run_name: string | null;
 	workflow_id: string;
 	target_dir: string;
 	status:
@@ -167,6 +168,7 @@ export interface RunHistoryResponse {
 
 export interface WorkflowRunState {
 	id: string;
+	run_name: string | null;
 	workflow_id: string;
 	target_dir: string;
 	goal: string;

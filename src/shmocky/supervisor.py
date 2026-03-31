@@ -162,6 +162,7 @@ class WorkflowSupervisor:
             run_entries.append(
                 RunHistoryEntry(
                     id=workflow_run.id,
+                    run_name=workflow_run.run_name,
                     workflow_id=workflow_run.workflow_id,
                     target_dir=workflow_run.target_dir,
                     status=workflow_run.status,
@@ -277,6 +278,7 @@ class WorkflowSupervisor:
             self._pause_gate.set()
             self._run_state = WorkflowRunState(
                 id=run_id,
+                run_name=payload.run_name.strip() if payload.run_name else None,
                 workflow_id=workflow.id,
                 target_dir=str(target_dir),
                 goal=payload.prompt,
@@ -311,9 +313,14 @@ class WorkflowSupervisor:
             self._persist_run_snapshot()
             await self._record_workflow_event(
                 "run_started",
-                f"Started workflow '{workflow.id}' for {target_dir}",
+                (
+                    f"Started run '{self._run_state.run_name}' using workflow '{workflow.id}' for {target_dir}"
+                    if self._run_state.run_name
+                    else f"Started workflow '{workflow.id}' for {target_dir}"
+                ),
                 payload={
                     "runId": run_id,
+                    "runName": self._run_state.run_name,
                     "workflowId": workflow.id,
                     "targetDir": str(target_dir),
                 },

@@ -46,6 +46,7 @@ let requestError: string | null = $state(null);
 let socketState: "connecting" | "open" | "closed" = $state("connecting");
 let selectedRunView = $state("live");
 let selectedWorkflowId = $state("");
+let runName = $state("");
 let targetDir = $state("");
 let startPrompt = $state("");
 let steerNote = $state("");
@@ -190,12 +191,14 @@ async function startWorkflowRun() {
 		const snapshot = await request<DashboardSnapshot>("/api/runs", {
 			method: "POST",
 			body: JSON.stringify({
+				run_name: runName.trim() || null,
 				workflow_id: selectedWorkflowId,
 				target_dir: targetDir.trim(),
 				prompt: startPrompt.trim(),
 			}),
 		});
 		applySnapshot(snapshot);
+		runName = "";
 		startPrompt = "";
 		steerNote = "";
 		await refreshRuns();
@@ -598,6 +601,18 @@ function transcriptHasContent() {
 	);
 }
 
+function runDisplayName(
+	run:
+		| {
+				run_name?: string | null;
+				workflow_id: string;
+		  }
+		| null
+		| undefined,
+) {
+	return run?.run_name?.trim() || run?.workflow_id || "No active workflow run";
+}
+
 function selectedWorkflow(): WorkflowDefinition | null {
 	return (
 		workflowCatalog?.workflows.find(
@@ -704,7 +719,10 @@ onMount(() => {
 				<div class="flex min-w-0 flex-col gap-1">
 					<div class="text-[0.92rem] font-medium">Transcript</div>
 					<div class="min-w-0 truncate text-[0.78rem] text-muted-foreground">
-						{activeRun() ? `${activeRun()?.workflow_id} · ${trimMiddle(activeRun()?.id, 18, 8)}` : "No active workflow run"}
+						{runDisplayName(activeRun())}
+						{#if activeRun()}
+							<span> · {trimMiddle(activeRun()?.id, 18, 8)}</span>
+						{/if}
 					</div>
 				</div>
 				<div class="flex flex-wrap items-center gap-2">
@@ -718,7 +736,7 @@ onMount(() => {
 						<option value="live">Current view</option>
 						{#each runHistory as run}
 							<option value={run.id}>
-								{run.workflow_id} · {formatShortDateTime(run.started_at)} · {humanizeStatus(run.status)}
+								{runDisplayName(run)} · {formatShortDateTime(run.started_at)} · {humanizeStatus(run.status)}
 							</option>
 						{/each}
 					</select>
@@ -975,6 +993,16 @@ onMount(() => {
 				{#if operatorRailTab === "run"}
 					<div class="min-h-0 overflow-y-auto px-5 py-4">
 						<div class="grid gap-3">
+							<div class="grid gap-2">
+								<label class="text-[0.72rem] text-muted-foreground" for="run-name">Run name</label>
+								<input
+									id="run-name"
+									bind:value={runName}
+									placeholder="workflow testing xyz"
+									class="h-10 rounded-md border border-border bg-background px-3 text-[0.84rem] outline-none"
+									disabled={workflowActive()}
+								/>
+							</div>
 							<div class="grid gap-2">
 								<label class="text-[0.72rem] text-muted-foreground" for="workflow-select">
 									Workflow
