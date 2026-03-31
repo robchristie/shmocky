@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shmocky"
+version = "0.1.0"
+description = "Thin browser wrapper around codex app-server for autonomous engineering loops"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.135.2",
+    "pydantic-settings>=2.13.1",
+    "uvicorn[standard]>=0.42.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.8",
+    "ty>=0.0.26",
+]
+
+[project.scripts]
+shmocky-api = "shmocky.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.8",
+    "ty>=0.0.26",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shmocky"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

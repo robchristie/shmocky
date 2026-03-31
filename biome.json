@@ -1,0 +1,16 @@
+{
+	"files": {
+		"includes": [
+			"apps/web/src/**/*.ts",
+			"apps/web/src/**/*.svelte",
+			"apps/web/vite.config.ts",
+			"apps/web/svelte.config.js"
+		]
+	},
+	"linter": {
+		"enabled": false
+	},
+	"formatter": {
+		"indentStyle": "tab"
+	}
+}
