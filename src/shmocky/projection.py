@@ -107,21 +107,34 @@ class SessionProjection:
     ) -> None:
         if not thread_payload:
             return
+        previous = self._state.thread if self._state.thread and self._state.thread.id == thread_payload["id"] else None
         sandbox = response.get("sandbox") if response else None
-        sandbox_type = None
+        sandbox_type = previous.sandbox_mode if previous is not None else None
         if isinstance(sandbox, dict):
             sandbox_type = sandbox.get("type")
         self._state.thread = ThreadState(
             id=thread_payload["id"],
-            status=thread_payload.get("status", {}).get("type", "idle"),
-            cwd=thread_payload.get("cwd"),
-            model=response.get("model") if response else None,
-            model_provider=response.get("modelProvider") if response else thread_payload.get("modelProvider"),
-            approval_policy=response.get("approvalPolicy") if response else None,
+            status=thread_payload.get("status", {}).get("type", previous.status if previous is not None else "idle"),
+            cwd=thread_payload.get("cwd", previous.cwd if previous is not None else None),
+            model=response.get("model") if response else (previous.model if previous is not None else None),
+            model_provider=(
+                response.get("modelProvider")
+                if response
+                else thread_payload.get("modelProvider", previous.model_provider if previous is not None else None)
+            ),
+            approval_policy=(
+                response.get("approvalPolicy")
+                if response
+                else (previous.approval_policy if previous is not None else None)
+            ),
             sandbox_mode=sandbox_type,
-            reasoning_effort=response.get("reasoningEffort") if response else None,
-            created_at=thread_payload.get("createdAt"),
-            updated_at=thread_payload.get("updatedAt"),
+            reasoning_effort=(
+                response.get("reasoningEffort")
+                if response
+                else (previous.reasoning_effort if previous is not None else None)
+            ),
+            created_at=thread_payload.get("createdAt", previous.created_at if previous is not None else None),
+            updated_at=thread_payload.get("updatedAt", previous.updated_at if previous is not None else None),
         )
 
     def _update_turn(self, turn_payload: dict[str, Any] | None) -> None:

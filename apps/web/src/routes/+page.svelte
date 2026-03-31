@@ -10,6 +10,17 @@ import type {
 	StreamEnvelope,
 } from "$lib/types";
 
+type EventStreamEntry = {
+	id: string;
+	recordedAt: string;
+	method: string | null;
+	messageType: RawEventRecord["message_type"];
+	summary: string;
+	chunkCount: number;
+};
+
+type EventStreamMode = "coalesced" | "important" | "raw";
+
 let dashboardState: DashboardState | null = $state(null);
 let recentEvents: RawEventRecord[] = $state([]);
 let prompt = $state("");
@@ -23,6 +34,7 @@ let transcriptPane: HTMLDivElement | null = $state(null);
 let eventPane: HTMLDivElement | null = $state(null);
 let autoScrollTranscript = $state(true);
 let autoScrollEvents = $state(true);
+let eventStreamMode: EventStreamMode = $state("coalesced");
 let reconnectTimer: number | null = null;
 let socket: WebSocket | null = null;
 
@@ -226,6 +238,96 @@ function summarizeEvent(event: RawEventRecord) {
 	return event.message_type;
 }
 
+function deltaGroupKey(event: RawEventRecord) {
+	if (!event.method?.endsWith("/delta")) {
+		return null;
+	}
+	const payload = event.payload as {
+		params?: {
+			itemId?: string;
+			threadId?: string;
+			turnId?: string;
+			commandId?: string;
+		};
+	};
+	const params = payload.params;
+	if (!params) {
+		return event.method;
+	}
+	return [
+		event.method,
+		params.threadId ?? "",
+		params.turnId ?? "",
+		params.itemId ?? "",
+		params.commandId ?? "",
+	].join(":");
+}
+
+function coalesceEventStream(events: RawEventRecord[]): EventStreamEntry[] {
+	const entries: EventStreamEntry[] = [];
+	for (const event of events) {
+		const summary = summarizeEvent(event);
+		const groupKey = deltaGroupKey(event);
+		const lastEntry = entries.at(-1);
+		if (groupKey && lastEntry?.id === groupKey) {
+			lastEntry.summary += summary;
+			lastEntry.chunkCount += 1;
+			lastEntry.recordedAt = event.recorded_at;
+			continue;
+		}
+		entries.push({
+			id: groupKey ?? event.event_id,
+			recordedAt: event.recorded_at,
+			method: event.method,
+			messageType: event.message_type,
+			summary,
+			chunkCount: 1,
+		});
+	}
+	return entries;
+}
+
+function isImportantEvent(event: RawEventRecord) {
+	if (event.channel === "stderr" || event.channel === "lifecycle") {
+		return true;
+	}
+	if (event.message_type === "server_request") {
+		return true;
+	}
+	if (event.method === "error" || event.method === "serverRequest/resolved") {
+		return true;
+	}
+	if (
+		event.method?.startsWith("thread/") ||
+		event.method?.startsWith("turn/") ||
+		event.method?.startsWith("item/started") ||
+		event.method?.startsWith("item/completed")
+	) {
+		return true;
+	}
+	if (
+		event.method === "item/commandExecution/terminalInteraction" ||
+		event.method === "item/fileChange/outputDelta" ||
+		event.method === "item/commandExecution/outputDelta" ||
+		event.method === "mcpServer/startupStatus/updated" ||
+		event.method === "account/rateLimits/updated"
+	) {
+		return true;
+	}
+	return false;
+}
+
+function rawEventStream(events: RawEventRecord[]): EventStreamEntry[] {
+	return events.map((event) => ({
+		id: event.event_id,
+		recordedAt: event.recorded_at,
+		method: event.method,
+		messageType: event.message_type,
+		summary: summarizeEvent(event),
+		chunkCount: 1,
+	}));
+}
+
 function trimMiddle(value: string | null | undefined, left = 30, right = 16) {
 	if (!value) {
 		return "—";
@@ -258,6 +360,16 @@ function turnRunning() {
 	);
 }
 
+function eventStreamEntries() {
+	if (eventStreamMode === "raw") {
+		return rawEventStream(recentEvents);
+	}
+	if (eventStreamMode === "important") {
+		return coalesceEventStream(recentEvents.filter(isImportantEvent));
+	}
+	return coalesceEventStream(recentEvents);
+}
+
 $effect(() => {
 	const transcriptCount = dashboardState?.transcript.length ?? 0;
 	void transcriptCount;
@@ -271,6 +383,7 @@ $effect(() => {
 $effect(() => {
 	const eventCount = recentEvents.length;
 	void eventCount;
+	void eventStreamMode;
 	void tick().then(() => {
 		if (eventPane && autoScrollEvents) {
 			eventPane.scrollTop = eventPane.scrollHeight;
@@ -457,29 +570,45 @@ onMount(() => {
 			</div>
 
 			<div class="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]">
-				<div class="border-b border-border px-5 py-3 text-[0.92rem] font-medium">
-					Event stream
+				<div class="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
+					<div class="text-[0.92rem] font-medium">Event stream</div>
+					<div class="flex items-center gap-2">
+						{#each ["coalesced", "important", "raw"] as mode}
+							<Button
+								variant={eventStreamMode === mode ? "secondary" : "outline"}
+								size="xs"
+								onclick={() => {
+									eventStreamMode = mode as EventStreamMode;
+								}}
+							>
+								{mode}
+							</Button>
+						{/each}
+					</div>
 				</div>
 				<div bind:this={eventPane} class="min-h-0 overflow-y-auto" onscroll={() => updateScrollMode('events')}>
-					{#if !recentEvents.length}
+					{#if !eventStreamEntries().length}
 						<div class="px-5 py-6 text-[0.82rem] text-muted-foreground">
 							No protocol events captured yet.
 						</div>
 					{:else}
-						{#each recentEvents as event (event.event_id)}
+						{#each eventStreamEntries() as event (event.id)}
 							<div
 								transition:fade={{ duration: 120 }}
 								class="grid grid-cols-[5rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-3"
 							>
 								<div class="pt-0.5 text-[0.72rem] text-muted-foreground">
-									{formatClock(event.recorded_at)}
+									{formatClock(event.recordedAt)}
 								</div>
 								<div class="min-w-0">
 									<div class="truncate text-[0.77rem] text-foreground">
-										{event.method ?? event.message_type}
+										{event.method ?? event.messageType}
+										{#if event.chunkCount > 1}
+											<span class="text-muted-foreground"> · {event.chunkCount} chunks</span>
+										{/if}
 									</div>
-									<div class="mt-1 truncate text-[0.73rem] text-muted-foreground">
-										{summarizeEvent(event)}
+									<div class="mt-1 whitespace-pre-wrap break-words text-[0.73rem] text-muted-foreground">
+										{event.summary}
 									</div>
 								</div>
 							</div>

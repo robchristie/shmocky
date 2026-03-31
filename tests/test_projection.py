@@ -105,3 +105,52 @@ def test_projection_tracks_server_requests() -> None:
     assert snapshot.pending_server_request is not None
     assert snapshot.pending_server_request.request_id == "42"
     assert snapshot.pending_server_request.method == "item/commandExecution/requestApproval"
+
+
+def test_thread_started_notification_preserves_response_metadata() -> None:
+    projection = SessionProjection(
+        workspace_root="/tmp/workspace",
+        event_log_path="/tmp/workspace/.shmocky/events/test.jsonl",
+    )
+
+    projection.apply_response(
+        "thread/start",
+        {
+            "thread": {
+                "id": "thread-1",
+                "status": {"type": "idle"},
+                "cwd": "/tmp/workspace",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "modelProvider": "openai",
+            },
+            "model": "gpt-5.4",
+            "modelProvider": "openai",
+            "approvalPolicy": "never",
+            "sandbox": {"type": "workspaceWrite"},
+            "reasoningEffort": "high",
+        },
+    )
+
+    projection.apply_notification(
+        "thread/started",
+        {
+            "thread": {
+                "id": "thread-1",
+                "status": {"type": "idle"},
+                "cwd": "/tmp/workspace",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "modelProvider": "openai",
+            },
+        },
+    )
+
+    snapshot = projection.snapshot()
+
+    assert snapshot.thread is not None
+    assert snapshot.thread.model == "gpt-5.4"
+    assert snapshot.thread.approval_policy == "never"
+    assert snapshot.thread.sandbox_mode == "workspaceWrite"
+    assert snapshot.thread.reasoning_effort == "high"
+    assert snapshot.thread.updated_at == 2
