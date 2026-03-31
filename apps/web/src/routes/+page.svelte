@@ -24,6 +24,14 @@ type EventStreamEntry = {
 	chunkCount: number;
 };
 
+type DerivedTranscriptEntry = {
+	id: string;
+	speaker: string;
+	title: string;
+	body: string;
+	tone: "default" | "muted";
+};
+
 type EventStreamMode = "coalesced" | "important" | "raw";
 type OperatorRailTab = "run" | "activity" | "protocol";
 
@@ -557,6 +565,39 @@ function stoppedOnLoopBudget() {
 	);
 }
 
+function transcriptExtras(): DerivedTranscriptEntry[] {
+	const run = activeRun();
+	if (!run) {
+		return [];
+	}
+	const extras: DerivedTranscriptEntry[] = [];
+	if (run.last_expert_assessment) {
+		extras.push({
+			id: `expert-assessment-${run.id}`,
+			speaker: "Expert",
+			title: "Assessment",
+			body: run.last_expert_assessment,
+			tone: "default",
+		});
+	}
+	if (stoppedOnLoopBudget() && run.last_continuation_prompt) {
+		extras.push({
+			id: `judge-continuation-${run.id}`,
+			speaker: "Judge",
+			title: "Continuation Prompt",
+			body: run.last_continuation_prompt,
+			tone: "default",
+		});
+	}
+	return extras;
+}
+
+function transcriptHasContent() {
+	return (
+		(viewedState()?.transcript.length ?? 0) > 0 || transcriptExtras().length > 0
+	);
+}
+
 function selectedWorkflow(): WorkflowDefinition | null {
 	return (
 		workflowCatalog?.workflows.find(
@@ -566,7 +607,8 @@ function selectedWorkflow(): WorkflowDefinition | null {
 }
 
 $effect(() => {
-	const transcriptCount = viewedState()?.transcript.length ?? 0;
+	const transcriptCount =
+		(viewedState()?.transcript.length ?? 0) + transcriptExtras().length;
 	void transcriptCount;
 	void tick().then(() => {
 		if (transcriptPane && autoScrollTranscript) {
@@ -715,7 +757,7 @@ onMount(() => {
 			>
 				{#if loading}
 					<div class="px-5 py-6 text-[0.85rem] text-muted-foreground">Loading session state…</div>
-				{:else if !viewedState()?.transcript.length}
+				{:else if !transcriptHasContent()}
 					<div class="px-5 py-6 text-[0.85rem] text-muted-foreground">
 						{#if selectedRunView === "live"}
 							Launch a workflow run from the right rail to start the Codex transcript.
@@ -745,6 +787,26 @@ onMount(() => {
 									{#if item.phase}
 										<span> · {item.phase.replaceAll("_", " ")}</span>
 									{/if}
+								</div>
+							</div>
+						</div>
+					{/each}
+					{#each transcriptExtras() as entry (entry.id)}
+						<div
+							transition:fade={{ duration: 120 }}
+							class="grid grid-cols-[4.6rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-4"
+						>
+							<div class="pt-0.5 text-[0.73rem] text-muted-foreground">
+								{entry.speaker}
+							</div>
+							<div class="min-w-0">
+								<div class="text-[0.72rem] text-muted-foreground">{entry.title}</div>
+								<div
+									class={`mt-2 whitespace-pre-wrap break-words text-[0.86rem] leading-6 ${
+										entry.tone === "default" ? "text-foreground" : "text-muted-foreground"
+									}`}
+								>
+									{entry.body}
 								</div>
 							</div>
 						</div>
@@ -834,25 +896,9 @@ onMount(() => {
 							{activeRun()?.last_judge_decision}: {activeRun()?.last_judge_summary}
 						</div>
 					{/if}
-					{#if activeRun()?.last_expert_assessment}
-						<div class="border-t border-border pt-3">
-							<div class="text-[0.72rem] text-muted-foreground">Expert assessment</div>
-							<div class="mt-2 whitespace-pre-wrap rounded-md border border-border px-3 py-3 text-[0.75rem] leading-6 text-foreground">
-								{activeRun()?.last_expert_assessment}
-							</div>
-						</div>
-					{/if}
 					{#if activeRun()?.last_error}
 						<div class="border-t border-border pt-2 text-[0.74rem] text-[#c97c6b]">
 							{activeRun()?.last_error}
-						</div>
-					{/if}
-					{#if stoppedOnLoopBudget() && activeRun()?.last_continuation_prompt}
-						<div class="border-t border-border pt-3">
-							<div class="text-[0.72rem] text-muted-foreground">Continuation prompt</div>
-							<div class="mt-2 whitespace-pre-wrap rounded-md border border-border px-3 py-3 text-[0.75rem] leading-6 text-foreground">
-								{activeRun()?.last_continuation_prompt}
-							</div>
 						</div>
 					{/if}
 				</div>
