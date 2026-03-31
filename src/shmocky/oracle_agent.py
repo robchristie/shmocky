@@ -17,6 +17,10 @@ class OracleNotConfiguredError(OracleAgentError):
     pass
 
 
+class OraclePromptTooLongError(OracleAgentError):
+    pass
+
+
 class OracleAgent:
     def __init__(self, settings: AppSettings) -> None:
         self._settings = settings
@@ -32,6 +36,7 @@ class OracleAgent:
         remote_host: str | None = None,
         model_strategy: str | None = None,
         timeout_seconds: float | None = None,
+        prompt_char_limit: int | None = None,
     ) -> OracleQueryResponse:
         async with self._lock:
             return await self._run_query(
@@ -39,6 +44,7 @@ class OracleAgent:
                 remote_host=remote_host,
                 model_strategy=model_strategy,
                 timeout_seconds=timeout_seconds,
+                prompt_char_limit=prompt_char_limit,
             )
 
     async def _run_query(
@@ -48,11 +54,20 @@ class OracleAgent:
         remote_host: str | None,
         model_strategy: str | None,
         timeout_seconds: float | None,
+        prompt_char_limit: int | None,
     ) -> OracleQueryResponse:
         token = self._settings.oracle_remote_token
         if token is None:
             raise OracleNotConfiguredError(
                 "Oracle remote token is not configured. Set ORACLE_REMOTE_TOKEN in .env."
+            )
+        effective_prompt_limit = (
+            prompt_char_limit or self._settings.oracle_prompt_char_limit
+        )
+        if len(request.prompt) > effective_prompt_limit:
+            raise OraclePromptTooLongError(
+                "Oracle prompt exceeds the configured character limit "
+                f"({effective_prompt_limit})."
             )
 
         attached_files = self._resolve_files(request.files)

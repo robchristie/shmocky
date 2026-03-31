@@ -17,6 +17,7 @@ provider = "oracle"
 role = "judge"
 model_strategy = "current"
 timeout_seconds = 1200
+prompt_char_limit = 40000
 startup_prompt = """
 You are the workflow judge. Return strict JSON only. Prefer continue over complete unless the goal is genuinely satisfied.
 """

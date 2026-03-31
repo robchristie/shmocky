@@ -7,7 +7,7 @@ import pytest
 from pydantic import SecretStr
 
 from shmocky.models import OracleQueryRequest
-from shmocky.oracle_agent import OracleAgent, OracleNotConfiguredError
+from shmocky.oracle_agent import OracleAgent, OracleNotConfiguredError, OraclePromptTooLongError
 from shmocky.settings import AppSettings
 
 
@@ -91,3 +91,46 @@ def test_oracle_agent_requires_token(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     with pytest.raises(OracleNotConfiguredError):
         asyncio.run(agent.query(OracleQueryRequest(prompt="hello")))
+
+
+def test_oracle_agent_enforces_default_prompt_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ORACLE_REMOTE_TOKEN", raising=False)
+    agent = OracleAgent(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+            oracle_remote_token=SecretStr("secret-token"),
+            oracle_prompt_char_limit=1_000,
+        )
+    )
+
+    with pytest.raises(OraclePromptTooLongError):
+        asyncio.run(agent.query(OracleQueryRequest(prompt="x" * 1_001)))
+
+
+def test_oracle_agent_enforces_per_call_prompt_limit_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ORACLE_REMOTE_TOKEN", raising=False)
+    agent = OracleAgent(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+            oracle_remote_token=SecretStr("secret-token"),
+            oracle_prompt_char_limit=10_000,
+        )
+    )
+
+    with pytest.raises(OraclePromptTooLongError):
+        asyncio.run(
+            agent.query(
+                OracleQueryRequest(prompt="x" * 1_001),
+                prompt_char_limit=1_000,
+            )
+        )

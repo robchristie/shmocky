@@ -71,9 +71,6 @@ function applySnapshot(snapshot: DashboardSnapshot) {
 	dashboardState = snapshot.state;
 	recentEvents = snapshot.recent_events;
 	recentWorkflowEvents = snapshot.recent_workflow_events;
-	if (!targetDir.trim()) {
-		targetDir = snapshot.state.workspace_root;
-	}
 	loading = false;
 	requestError = null;
 }
@@ -549,7 +546,7 @@ onMount(() => {
 			<div class="flex min-w-0 flex-col gap-1">
 				<div class="text-[1rem] font-medium tracking-[-0.02em]">Shmocky</div>
 				<div class="min-w-0 truncate text-[0.83rem] text-muted-foreground">
-					{dashboardState?.workspace_root ?? "/nvme/development/shmocky"}
+					{activeRun()?.target_dir ?? dashboardState?.workspace_root ?? "/nvme/development/shmocky"}
 				</div>
 			</div>
 			<div class="flex flex-wrap items-center gap-5 text-[0.76rem] text-muted-foreground">
@@ -733,6 +730,7 @@ onMount(() => {
 						<input
 							id="target-dir"
 							bind:value={targetDir}
+							placeholder="/absolute/path/to/repository-or-standalone-workdir"
 							class="h-10 rounded-md border border-border bg-background px-3 text-[0.84rem] outline-none"
 							disabled={workflowActive()}
 						/>
@@ -787,6 +785,9 @@ onMount(() => {
 								<div class="truncate text-foreground">
 									{selectedWorkflow()?.max_loops} loops · {selectedWorkflow()?.max_judge_calls} judges · {selectedWorkflow()?.max_runtime_minutes} min
 								</div>
+							</div>
+							<div class="border-t border-border pt-2 text-[0.72rem]">
+								Use a repository root or a standalone directory outside the Shmocky repo. Nested paths inside another repo are rejected for isolation.
 							</div>
 						</div>
 					{/if}

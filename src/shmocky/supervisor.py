@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -182,11 +183,7 @@ class WorkflowSupervisor:
             if workflow is None:
                 raise WorkflowNotFoundError(f"Unknown workflow '{payload.workflow_id}'.")
 
-            target_dir = Path(payload.target_dir).expanduser().resolve()
-            if not target_dir.exists() or not target_dir.is_dir():
-                raise WorkflowSupervisorError(
-                    f"Target directory does not exist or is not a directory: {target_dir}"
-                )
+            target_dir = self._validate_target_dir(Path(payload.target_dir))
 
             agent_by_id = {agent.id: agent for agent in catalog.agents}
             codex_agent = agent_by_id[workflow.executor_agent]
@@ -244,6 +241,33 @@ class WorkflowSupervisor:
             )
             await self._broadcast_state()
             return self.snapshot()
+
+    def _validate_target_dir(self, target_dir: Path) -> Path:
+        resolved = target_dir.expanduser().resolve()
+        if not resolved.exists() or not resolved.is_dir():
+            raise WorkflowSupervisorError(
+                f"Target directory does not exist or is not a directory: {resolved}"
+            )
+        if not self._settings.allow_nested_target_dirs and resolved.is_relative_to(
+            self._settings.workspace_root
+        ):
+            raise WorkflowSupervisorError(
+                "Target directory is inside the Shmocky workspace. "
+                "Use a repository root or an external directory for isolation."
+            )
+
+        containing_git_root = self._git_root_for(resolved)
+        if (
+            not self._settings.allow_nested_target_dirs
+            and containing_git_root is not None
+            and containing_git_root != resolved
+        ):
+            raise WorkflowSupervisorError(
+                "Target directory is nested inside another git repository: "
+                f"{containing_git_root}. Use the repository root itself so parent repo "
+                "instructions and history do not leak into the run."
+            )
+        return resolved
 
     async def pause_run(self) -> DashboardSnapshot:
         async with self._lock:
@@ -399,9 +423,13 @@ class WorkflowSupervisor:
                 await self._ensure_checkpoint("judging", f"Oracle evaluation loop {loop_index}.")
                 await self._check_budgets(loop_index, started_at, before_judge=True)
                 judge_bundle = await self._build_judge_bundle(codex_output)
-                judge_prompt = self._render_template(
+                judge_prompt_limit = (
+                    judge_agent.prompt_char_limit or self._settings.oracle_prompt_char_limit
+                )
+                judge_prompt = self._render_judge_prompt(
                     workflow.judge_prompt_template,
-                    goal=self._run_state.goal,
+                    prompt_limit=judge_prompt_limit,
+                    goal=self._run_state.goal or "",
                     plan=plan_output,
                     last_output=codex_output,
                     judge_bundle=judge_bundle,
@@ -484,6 +512,7 @@ class WorkflowSupervisor:
             remote_host=judge_agent.remote_host,
             model_strategy=judge_agent.model_strategy,
             timeout_seconds=judge_agent.timeout_seconds,
+            prompt_char_limit=judge_agent.prompt_char_limit,
         )
         raw_answer = response.answer.strip()
         if self._resources is not None:
@@ -694,6 +723,22 @@ class WorkflowSupervisor:
         return ""
 
     @staticmethod
+    def _git_root_for(path: Path) -> Path | None:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return None
+        if completed.returncode != 0:
+            return None
+        root = completed.stdout.strip()
+        return Path(root).resolve() if root else None
+
+    @staticmethod
     def _extract_json(text: str) -> str:
         stripped = text.strip()
         if stripped.startswith("```"):
@@ -711,6 +756,36 @@ class WorkflowSupervisor:
         for key, value in values.items():
             rendered = rendered.replace("{" + key + "}", value)
         return rendered
+
+    @classmethod
+    def _render_judge_prompt(
+        cls,
+        template: str,
+        *,
+        prompt_limit: int,
+        **values: str,
+    ) -> str:
+        current_values = {key: value for key, value in values.items()}
+        prompt = cls._render_template(template, **current_values)
+        if len(prompt) <= prompt_limit:
+            return prompt
+
+        for key in ("judge_bundle", "last_output", "plan", "goal"):
+            current = current_values.get(key, "")
+            if not current:
+                continue
+            overflow = len(prompt) - prompt_limit
+            if overflow <= 0:
+                break
+            new_limit = max(256, len(current) - overflow - 256)
+            current_values[key] = cls._clip(current, limit=new_limit) or ""
+            prompt = cls._render_template(template, **current_values)
+            if len(prompt) <= prompt_limit:
+                return prompt
+
+        if len(prompt) > prompt_limit:
+            return prompt[: prompt_limit - 1] + "…"
+        return prompt
 
     @staticmethod
     def _clip(text: str | None, *, limit: int = 4_000) -> str | None:

@@ -133,7 +133,8 @@ class PromptRequest(BaseModel):
 
 
 class OracleQueryRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=20_000)
+    prompt: str = Field(min_length=1)
+    agent_id: str | None = Field(default=None, min_length=1, max_length=200)
     files: list[str] = Field(default_factory=list, max_length=64)
 
 
@@ -165,6 +166,7 @@ class OracleAgentConfig(BaseModel):
     remote_host: str | None = None
     model_strategy: Literal["current", "ignore"] = "current"
     timeout_seconds: float | None = None
+    prompt_char_limit: int | None = Field(default=None, ge=1_000, le=200_000)
 
 
 class AgentDefinition(BaseModel):
@@ -183,6 +185,7 @@ class AgentDefinition(BaseModel):
     remote_host: str | None = None
     model_strategy: Literal["current", "ignore"] | None = None
     timeout_seconds: float | None = None
+    prompt_char_limit: int | None = Field(default=None, ge=1_000, le=200_000)
 
 
 class WorkflowDefinition(BaseModel):

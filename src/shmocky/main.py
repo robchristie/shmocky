@@ -17,7 +17,12 @@ from .models import (
     WorkflowRunState,
     WorkflowSteerRequest,
 )
-from .oracle_agent import OracleAgent, OracleAgentError, OracleNotConfiguredError
+from .oracle_agent import (
+    OracleAgent,
+    OracleAgentError,
+    OracleNotConfiguredError,
+    OraclePromptTooLongError,
+)
 from .settings import AppSettings
 from .supervisor import WorkflowSupervisor, as_http_error
 
@@ -93,9 +98,48 @@ def create_app() -> FastAPI:
     @app.post("/api/oracle/query", response_model=OracleQueryResponse)
     async def oracle_query(payload: OracleQueryRequest) -> OracleQueryResponse:
         try:
-            return await oracle.query(payload)
+            remote_host: str | None = None
+            model_strategy: str | None = None
+            timeout_seconds: float | None = None
+            prompt_char_limit: int | None = None
+            if payload.agent_id is not None:
+                catalog = supervisor.workflows_catalog()
+                if not catalog.loaded:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Workflow config is not available, so Oracle agent settings "
+                            "cannot be resolved."
+                        ),
+                    )
+                oracle_agent = next(
+                    (
+                        agent
+                        for agent in catalog.agents
+                        if agent.id == payload.agent_id and agent.provider == "oracle"
+                    ),
+                    None,
+                )
+                if oracle_agent is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Unknown Oracle agent '{payload.agent_id}'.",
+                    )
+                remote_host = oracle_agent.remote_host
+                model_strategy = oracle_agent.model_strategy
+                timeout_seconds = oracle_agent.timeout_seconds
+                prompt_char_limit = oracle_agent.prompt_char_limit
+            return await oracle.query(
+                payload,
+                remote_host=remote_host,
+                model_strategy=model_strategy,
+                timeout_seconds=timeout_seconds,
+                prompt_char_limit=prompt_char_limit,
+            )
         except OracleNotConfiguredError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except OraclePromptTooLongError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except OracleAgentError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 

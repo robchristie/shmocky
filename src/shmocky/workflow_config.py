@@ -173,6 +173,7 @@ class WorkflowConfigLoader:
             "remote_host",
             "model_strategy",
             "timeout_seconds",
+            "prompt_char_limit",
         }
         allowed_keys = codex_keys if agent.provider == "codex" else oracle_keys
         unknown_keys = sorted(set(raw_agent) - allowed_keys)

@@ -25,6 +25,7 @@ web_access = "live"
 provider = "oracle"
 role = "judge"
 model_strategy = "current"
+prompt_char_limit = 64000
 
 [workflows.plan_execute_judge]
 planner_agent = "engineer"
@@ -48,6 +49,7 @@ max_judge_calls = 3
     assert catalog.loaded is True
     assert [agent.id for agent in catalog.agents] == ["engineer", "judge"]
     assert [workflow.id for workflow in catalog.workflows] == ["plan_execute_judge"]
+    assert catalog.agents[1].prompt_char_limit == 64_000
     assert catalog.workflows[0].plan_prompt_template
     assert catalog.workflows[0].judge_prompt_template
 

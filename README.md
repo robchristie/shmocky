@@ -83,6 +83,11 @@ The current workflow shape is intentionally narrow:
 - one active run at a time
 - one Codex planner or executor thread per run
 - one Oracle judge that returns strict JSON decisions
+- target directories must be repository roots or standalone directories outside the Shmocky repo by default
+
+Oracle agent definitions can also carry role-specific sidecar settings such as `remote_host`,
+`timeout_seconds`, `model_strategy`, and `prompt_char_limit`, so different judge or analyst roles
+can run with different budgets from the same `shmocky.toml`.
 
 The backend exposes:
 
@@ -113,6 +118,7 @@ Query it directly through the API:
 curl -X POST http://127.0.0.1:8000/api/oracle/query \
   -H 'content-type: application/json' \
   -d '{
+    "agent_id": "judge",
     "prompt": "Review this architecture for hidden operational risks.",
     "files": ["README.md", "src/shmocky/**/*.py"]
   }'
@@ -123,6 +129,8 @@ Notes:
 - Oracle calls are serialized intentionally to avoid spamming the remote signed-in browser.
 - The current slice returns the final answer only. It does not stream partial Oracle output into the UI.
 - Attached `files` are resolved relative to the workspace root and expanded from glob patterns before invocation.
+- Oracle prompt size is bounded by the selected Oracle agent's `prompt_char_limit` when `agent_id` is
+  provided, otherwise it falls back to `SHMOCKY_ORACLE_PROMPT_CHAR_LIMIT` and defaults to `20000`.
 
 ## Quality Gates
 
