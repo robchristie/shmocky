@@ -55,6 +55,7 @@ export interface DashboardState {
 	mcp_servers: Record<string, string>;
 	rate_limits: Record<string, unknown> | null;
 	pending_server_request: PendingServerRequest | null;
+	workflow_run: WorkflowRunState | null;
 }
 
 export interface RawEventRecord {
@@ -78,10 +79,104 @@ export interface RawEventRecord {
 export interface DashboardSnapshot {
 	state: DashboardState;
 	recent_events: RawEventRecord[];
+	recent_workflow_events: WorkflowEventRecord[];
 }
 
 export interface StreamEnvelope {
-	type: "event" | "state";
+	type: "event" | "workflow_event" | "state";
 	state: DashboardState;
 	event: RawEventRecord | null;
+	workflow_event: WorkflowEventRecord | null;
+}
+
+export interface AgentDefinition {
+	id: string;
+	provider: "codex" | "oracle";
+	role: string;
+	startup_prompt: string | null;
+	description: string | null;
+	model: string | null;
+	model_provider: string | null;
+	reasoning_effort: string | null;
+	approval_policy: string | null;
+	sandbox_mode: string | null;
+	web_access: "disabled" | "cached" | "live" | null;
+	service_tier: "fast" | "flex" | null;
+	remote_host: string | null;
+	model_strategy: "current" | "ignore" | null;
+	timeout_seconds: number | null;
+}
+
+export interface WorkflowDefinition {
+	id: string;
+	kind: "linear_loop";
+	planner_agent: string;
+	executor_agent: string;
+	judge_agent: string;
+	plan_prompt_template: string;
+	execute_prompt_template: string;
+	judge_prompt_template: string;
+	max_loops: number;
+	max_runtime_minutes: number;
+	max_judge_calls: number;
+}
+
+export interface WorkflowCatalogResponse {
+	config_path: string;
+	loaded: boolean;
+	error: string | null;
+	agents: AgentDefinition[];
+	workflows: WorkflowDefinition[];
+}
+
+export interface WorkflowRunState {
+	id: string;
+	workflow_id: string;
+	target_dir: string;
+	goal: string;
+	status:
+		| "idle"
+		| "starting"
+		| "running"
+		| "paused"
+		| "completed"
+		| "failed"
+		| "stopped";
+	phase:
+		| "idle"
+		| "planning"
+		| "executing"
+		| "judging"
+		| "paused"
+		| "completed"
+		| "failed"
+		| "stopped";
+	codex_agent_id: string;
+	judge_agent_id: string;
+	started_at: string;
+	updated_at: string;
+	completed_at: string | null;
+	current_loop: number;
+	max_loops: number;
+	judge_calls: number;
+	max_judge_calls: number;
+	max_runtime_minutes: number;
+	last_plan: string | null;
+	last_codex_output: string | null;
+	last_judge_decision: "continue" | "complete" | "fail" | null;
+	last_judge_summary: string | null;
+	last_error: string | null;
+	pause_requested: boolean;
+	stop_requested: boolean;
+	pending_steering_notes: string[];
+	recent_steering_notes: string[];
+}
+
+export interface WorkflowEventRecord {
+	sequence: number;
+	event_id: string;
+	recorded_at: string;
+	kind: string;
+	message: string;
+	payload: unknown;
 }

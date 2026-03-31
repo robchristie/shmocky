@@ -20,6 +20,8 @@ class AppSettings(BaseSettings):
     codex_command: str = "codex"
     workspace_root: Path = Field(default_factory=Path.cwd)
     event_log_dir: Path = Field(default_factory=lambda: Path(".shmocky/events"))
+    run_log_dir: Path = Field(default_factory=lambda: Path(".shmocky/runs"))
+    workflow_config_path: Path = Field(default_factory=lambda: Path("shmocky.toml"))
     api_host: str = "127.0.0.1"
     api_port: int = 8000
     request_timeout_seconds: float = 45.0
@@ -52,9 +54,15 @@ class AppSettings(BaseSettings):
     def validate_paths(self) -> "AppSettings":
         self.workspace_root = self.workspace_root.expanduser().resolve()
         self.event_log_dir = self.event_log_dir.expanduser()
+        self.run_log_dir = self.run_log_dir.expanduser()
+        self.workflow_config_path = self.workflow_config_path.expanduser()
         self.oracle_remote_host = self._normalize_oracle_remote_host(self.oracle_remote_host)
         if not self.event_log_dir.is_absolute():
             self.event_log_dir = (self.workspace_root / self.event_log_dir).resolve()
+        if not self.run_log_dir.is_absolute():
+            self.run_log_dir = (self.workspace_root / self.run_log_dir).resolve()
+        if not self.workflow_config_path.is_absolute():
+            self.workflow_config_path = (self.workspace_root / self.workflow_config_path).resolve()
         if not self.workspace_root.exists():
             raise ValueError(f"Workspace root does not exist: {self.workspace_root}")
         if shutil.which(self.codex_command) is None:

@@ -8,6 +8,9 @@ import type {
 	DashboardState,
 	RawEventRecord,
 	StreamEnvelope,
+	WorkflowCatalogResponse,
+	WorkflowDefinition,
+	WorkflowEventRecord,
 } from "$lib/types";
 
 type EventStreamEntry = {
@@ -22,19 +25,28 @@ type EventStreamEntry = {
 type EventStreamMode = "coalesced" | "important" | "raw";
 
 let dashboardState: DashboardState | null = $state(null);
+let workflowCatalog: WorkflowCatalogResponse | null = $state(null);
 let recentEvents: RawEventRecord[] = $state([]);
-let prompt = $state("");
+let recentWorkflowEvents: WorkflowEventRecord[] = $state([]);
 let loading = $state(true);
 let requestError: string | null = $state(null);
 let socketState: "connecting" | "open" | "closed" = $state("connecting");
-let sendingPrompt = $state(false);
-let startingThread = $state(false);
-let interrupting = $state(false);
+let selectedWorkflowId = $state("");
+let targetDir = $state("");
+let startPrompt = $state("");
+let steerNote = $state("");
+let startingRun = $state(false);
+let pausingRun = $state(false);
+let resumingRun = $state(false);
+let stoppingRun = $state(false);
+let steeringRun = $state(false);
 let transcriptPane: HTMLDivElement | null = $state(null);
+let workflowPane: HTMLDivElement | null = $state(null);
 let eventPane: HTMLDivElement | null = $state(null);
 let autoScrollTranscript = $state(true);
+let autoScrollWorkflowEvents = $state(true);
 let autoScrollEvents = $state(true);
-let eventStreamMode: EventStreamMode = $state("coalesced");
+let eventStreamMode: EventStreamMode = $state("important");
 let reconnectTimer: number | null = null;
 let socket: WebSocket | null = null;
 
@@ -51,9 +63,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	return (await response.json()) as T;
 }
 
+function activeRun() {
+	return dashboardState?.workflow_run ?? null;
+}
+
 function applySnapshot(snapshot: DashboardSnapshot) {
 	dashboardState = snapshot.state;
 	recentEvents = snapshot.recent_events;
+	recentWorkflowEvents = snapshot.recent_workflow_events;
+	if (!targetDir.trim()) {
+		targetDir = snapshot.state.workspace_root;
+	}
 	loading = false;
 	requestError = null;
 }
@@ -65,6 +85,12 @@ function applyEnvelope(payload: StreamEnvelope | DashboardSnapshot) {
 		requestError = null;
 		if (payload.type === "event" && payload.event) {
 			recentEvents = [...recentEvents, payload.event].slice(-300);
+		}
+		if (payload.type === "workflow_event" && payload.workflow_event) {
+			recentWorkflowEvents = [
+				...recentWorkflowEvents,
+				payload.workflow_event,
+			].slice(-200);
 		}
 		return;
 	}
@@ -81,51 +107,109 @@ async function refreshState() {
 	}
 }
 
-async function startThread() {
-	startingThread = true;
+async function refreshWorkflows() {
 	try {
-		const snapshot = await request<DashboardSnapshot>("/api/thread/start", {
-			method: "POST",
-		});
-		applySnapshot(snapshot);
+		const catalog = await request<WorkflowCatalogResponse>("/api/workflows");
+		workflowCatalog = catalog;
+		if (!selectedWorkflowId && catalog.workflows.length > 0) {
+			selectedWorkflowId = catalog.workflows[0].id;
+		}
 	} catch (error) {
 		requestError = toErrorMessage(error);
-	} finally {
-		startingThread = false;
 	}
 }
 
-async function sendPrompt() {
-	const trimmed = prompt.trim();
-	if (!trimmed) {
+async function startWorkflowRun() {
+	if (!selectedWorkflowId || !targetDir.trim() || !startPrompt.trim()) {
 		return;
 	}
-	sendingPrompt = true;
+	startingRun = true;
 	try {
-		const snapshot = await request<DashboardSnapshot>("/api/turns", {
+		const snapshot = await request<DashboardSnapshot>("/api/runs", {
 			method: "POST",
-			body: JSON.stringify({ prompt: trimmed }),
+			body: JSON.stringify({
+				workflow_id: selectedWorkflowId,
+				target_dir: targetDir.trim(),
+				prompt: startPrompt.trim(),
+			}),
 		});
 		applySnapshot(snapshot);
-		prompt = "";
+		startPrompt = "";
+		steerNote = "";
 	} catch (error) {
 		requestError = toErrorMessage(error);
 	} finally {
-		sendingPrompt = false;
+		startingRun = false;
 	}
 }
 
-async function interruptTurn() {
-	interrupting = true;
+async function pauseRun() {
+	pausingRun = true;
 	try {
-		const snapshot = await request<DashboardSnapshot>("/api/turns/interrupt", {
+		const snapshot = await request<DashboardSnapshot>(
+			"/api/runs/active/pause",
+			{
+				method: "POST",
+			},
+		);
+		applySnapshot(snapshot);
+	} catch (error) {
+		requestError = toErrorMessage(error);
+	} finally {
+		pausingRun = false;
+	}
+}
+
+async function resumeRun() {
+	resumingRun = true;
+	try {
+		const snapshot = await request<DashboardSnapshot>(
+			"/api/runs/active/resume",
+			{
+				method: "POST",
+			},
+		);
+		applySnapshot(snapshot);
+	} catch (error) {
+		requestError = toErrorMessage(error);
+	} finally {
+		resumingRun = false;
+	}
+}
+
+async function stopRun() {
+	stoppingRun = true;
+	try {
+		const snapshot = await request<DashboardSnapshot>("/api/runs/active/stop", {
 			method: "POST",
 		});
 		applySnapshot(snapshot);
 	} catch (error) {
 		requestError = toErrorMessage(error);
 	} finally {
-		interrupting = false;
+		stoppingRun = false;
+	}
+}
+
+async function queueSteer() {
+	if (!steerNote.trim()) {
+		return;
+	}
+	steeringRun = true;
+	try {
+		const snapshot = await request<DashboardSnapshot>(
+			"/api/runs/active/steer",
+			{
+				method: "POST",
+				body: JSON.stringify({ note: steerNote.trim() }),
+			},
+		);
+		applySnapshot(snapshot);
+		steerNote = "";
+	} catch (error) {
+		requestError = toErrorMessage(error);
+	} finally {
+		steeringRun = false;
 	}
 }
 
@@ -164,6 +248,7 @@ function scheduleReconnect() {
 	reconnectTimer = window.setTimeout(() => {
 		reconnectTimer = null;
 		void refreshState();
+		void refreshWorkflows();
 		connectStream();
 	}, 1000);
 }
@@ -175,21 +260,23 @@ function stopReconnect() {
 	}
 }
 
-function handleComposerKeydown(event: KeyboardEvent) {
-	if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-		event.preventDefault();
-		void sendPrompt();
-	}
-}
-
-function updateScrollMode(kind: "transcript" | "events") {
-	const node = kind === "transcript" ? transcriptPane : eventPane;
+function updateScrollMode(kind: "transcript" | "workflow" | "events") {
+	const node =
+		kind === "transcript"
+			? transcriptPane
+			: kind === "workflow"
+				? workflowPane
+				: eventPane;
 	if (!node) {
 		return;
 	}
 	const pinned = node.scrollTop + node.clientHeight >= node.scrollHeight - 32;
 	if (kind === "transcript") {
 		autoScrollTranscript = pinned;
+		return;
+	}
+	if (kind === "workflow") {
+		autoScrollWorkflowEvents = pinned;
 		return;
 	}
 	autoScrollEvents = pinned;
@@ -199,7 +286,10 @@ function humanizeStatus(status: string | null | undefined) {
 	if (!status) {
 		return "idle";
 	}
-	return status.replaceAll(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+	return status
+		.replaceAll(/([a-z])([A-Z])/g, "$1 $2")
+		.replaceAll("_", " ")
+		.toLowerCase();
 }
 
 function formatClock(value: string) {
@@ -207,6 +297,18 @@ function formatClock(value: string) {
 		hour: "2-digit",
 		minute: "2-digit",
 		second: "2-digit",
+	}).format(new Date(value));
+}
+
+function formatShortDateTime(value: string | null | undefined) {
+	if (!value) {
+		return "—";
+	}
+	return new Intl.DateTimeFormat("en-AU", {
+		month: "short",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
 	}).format(new Date(value));
 }
 
@@ -328,6 +430,35 @@ function rawEventStream(events: RawEventRecord[]): EventStreamEntry[] {
 	}));
 }
 
+function eventStreamEntries() {
+	if (eventStreamMode === "raw") {
+		return rawEventStream(recentEvents);
+	}
+	if (eventStreamMode === "important") {
+		return coalesceEventStream(recentEvents.filter(isImportantEvent));
+	}
+	return coalesceEventStream(recentEvents);
+}
+
+function summarizeWorkflowEvent(event: WorkflowEventRecord) {
+	if (typeof event.payload === "object" && event.payload !== null) {
+		const payload = event.payload as Record<string, unknown>;
+		if (typeof payload.note === "string") {
+			return payload.note;
+		}
+		if (typeof payload.targetDir === "string") {
+			return payload.targetDir;
+		}
+		if (typeof payload.turnId === "string") {
+			return payload.turnId;
+		}
+		if (typeof payload.workflowId === "string") {
+			return payload.workflowId;
+		}
+	}
+	return event.message;
+}
+
 function trimMiddle(value: string | null | undefined, left = 30, right = 16) {
 	if (!value) {
 		return "—";
@@ -353,21 +484,21 @@ function codexConnected() {
 	return dashboardState?.connection.codex_connected ?? false;
 }
 
-function turnRunning() {
-	return Boolean(
-		dashboardState?.turn &&
-			!["completed", "failed"].includes(dashboardState.turn.status),
-	);
+function workflowActive() {
+	const status = activeRun()?.status;
+	return status === "starting" || status === "running" || status === "paused";
 }
 
-function eventStreamEntries() {
-	if (eventStreamMode === "raw") {
-		return rawEventStream(recentEvents);
-	}
-	if (eventStreamMode === "important") {
-		return coalesceEventStream(recentEvents.filter(isImportantEvent));
-	}
-	return coalesceEventStream(recentEvents);
+function workflowPaused() {
+	return activeRun()?.status === "paused";
+}
+
+function selectedWorkflow(): WorkflowDefinition | null {
+	return (
+		workflowCatalog?.workflows.find(
+			(workflow) => workflow.id === selectedWorkflowId,
+		) ?? null
+	);
 }
 
 $effect(() => {
@@ -376,6 +507,16 @@ $effect(() => {
 	void tick().then(() => {
 		if (transcriptPane && autoScrollTranscript) {
 			transcriptPane.scrollTop = transcriptPane.scrollHeight;
+		}
+	});
+});
+
+$effect(() => {
+	const workflowEventCount = recentWorkflowEvents.length;
+	void workflowEventCount;
+	void tick().then(() => {
+		if (workflowPane && autoScrollWorkflowEvents) {
+			workflowPane.scrollTop = workflowPane.scrollHeight;
 		}
 	});
 });
@@ -393,6 +534,7 @@ $effect(() => {
 
 onMount(() => {
 	void refreshState();
+	void refreshWorkflows();
 	connectStream();
 	return () => {
 		stopReconnect();
@@ -427,15 +569,19 @@ onMount(() => {
 						}`}
 					></span>
 					<span>codex</span>
-					<span class="text-foreground">{codexConnected() ? "connected" : "starting"}</span>
+					<span class="text-foreground">
+						{codexConnected() ? "connected" : "disconnected"}
+					</span>
 				</div>
 				<div class="flex items-center gap-2">
-					<span>thread</span>
-					<span class="text-foreground">{humanizeStatus(dashboardState?.thread?.status)}</span>
+					<span>workflow</span>
+					<span class="text-foreground">
+						{humanizeStatus(activeRun()?.status ?? (workflowCatalog?.loaded ? "idle" : "config error"))}
+					</span>
 				</div>
 				<div class="flex items-center gap-2">
-					<span>turn</span>
-					<span class="text-foreground">{humanizeStatus(dashboardState?.turn?.status)}</span>
+					<span>phase</span>
+					<span class="text-foreground">{humanizeStatus(activeRun()?.phase)}</span>
 				</div>
 				<div class="flex items-center gap-2">
 					<span>stream</span>
@@ -445,42 +591,54 @@ onMount(() => {
 		</div>
 	</header>
 
-	<main class="grid h-[calc(100svh-81px)] min-h-0 md:grid-cols-[minmax(0,1.65fr)_minmax(20rem,28rem)]">
+	<main class="grid h-[calc(100svh-81px)] min-h-0 md:grid-cols-[minmax(0,1.6fr)_minmax(22rem,31rem)]">
 		<section class="grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] border-b border-border md:border-r md:border-b-0">
 			<div class="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
 				<div class="flex min-w-0 flex-col gap-1">
 					<div class="text-[0.92rem] font-medium">Transcript</div>
 					<div class="min-w-0 truncate text-[0.78rem] text-muted-foreground">
-						{trimMiddle(dashboardState?.thread?.id)}
+						{activeRun() ? `${activeRun()?.workflow_id} · ${trimMiddle(activeRun()?.id, 18, 8)}` : "No active workflow run"}
 					</div>
 				</div>
 				<div class="flex flex-wrap items-center gap-2">
+					<Button variant="outline" size="sm" onclick={refreshState}>Refresh</Button>
 					<Button
 						variant="outline"
 						size="sm"
-						disabled={startingThread || !codexConnected()}
-						onclick={startThread}
+						disabled={!workflowActive() || workflowPaused() || pausingRun}
+						onclick={pauseRun}
 					>
-						{startingThread ? "Starting thread" : "Start thread"}
+						{pausingRun ? "Pausing" : "Pause"}
 					</Button>
-					<Button variant="outline" size="sm" onclick={refreshState}>Refresh</Button>
+					<Button
+						variant="outline"
+						size="sm"
+						disabled={!workflowPaused() || resumingRun}
+						onclick={resumeRun}
+					>
+						{resumingRun ? "Resuming" : "Resume"}
+					</Button>
 					<Button
 						variant="destructive"
 						size="sm"
-						disabled={!turnRunning() || interrupting}
-						onclick={interruptTurn}
+						disabled={!workflowActive() || stoppingRun}
+						onclick={stopRun}
 					>
-						{interrupting ? "Interrupting" : "Interrupt"}
+						{stoppingRun ? "Stopping" : "Stop"}
 					</Button>
 				</div>
 			</div>
 
-			<div bind:this={transcriptPane} class="min-h-0 overflow-y-auto" onscroll={() => updateScrollMode('transcript')}>
+			<div
+				bind:this={transcriptPane}
+				class="min-h-0 overflow-y-auto"
+				onscroll={() => updateScrollMode("transcript")}
+			>
 				{#if loading}
 					<div class="px-5 py-6 text-[0.85rem] text-muted-foreground">Loading session state…</div>
 				{:else if !dashboardState?.transcript.length}
 					<div class="px-5 py-6 text-[0.85rem] text-muted-foreground">
-						No thread output yet. Start the workspace thread or send a prompt.
+						Launch a workflow run from the right rail to start the Codex transcript.
 					</div>
 				{:else}
 					{#each dashboardState.transcript as item (item.item_id)}
@@ -489,20 +647,20 @@ onMount(() => {
 							class="grid grid-cols-[4.6rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-4"
 						>
 							<div class="pt-0.5 text-[0.73rem] text-muted-foreground">
-								{item.role === 'user' ? 'You' : 'Codex'}
+								{item.role === "user" ? "You" : "Codex"}
 							</div>
 							<div class="min-w-0">
 								<div
 									class={`whitespace-pre-wrap break-words text-[0.86rem] leading-6 ${
-										item.role === 'assistant' ? 'text-foreground' : 'text-[#d2d0ca]'
+										item.role === "assistant" ? "text-foreground" : "text-[#d2d0ca]"
 									}`}
 								>
-									{item.text || (item.status === 'streaming' ? '…' : '')}
+									{item.text || (item.status === "streaming" ? "…" : "")}
 								</div>
 								<div class="mt-2 text-[0.72rem] text-muted-foreground">
 									{humanizeStatus(item.status)}
 									{#if item.phase}
-										<span> · {item.phase.replaceAll('_', ' ')}</span>
+										<span> · {item.phase.replaceAll("_", " ")}</span>
 									{/if}
 								</div>
 							</div>
@@ -512,53 +670,159 @@ onMount(() => {
 			</div>
 
 			<div class="border-t border-border px-5 py-4">
-				<div class="grid gap-3">
-					<Textarea
-						bind:value={prompt}
-						rows={4}
-						placeholder="Send a prompt to the active workspace thread. Ctrl+Enter submits."
-						class="resize-none text-[0.84rem] leading-6"
-						disabled={!codexConnected() || sendingPrompt}
-						onkeydown={handleComposerKeydown}
-					/>
-					<div class="flex flex-wrap items-center justify-between gap-3">
-						<div class="text-[0.74rem] text-muted-foreground">
-							{#if requestError}
-								{requestError}
-							{:else if dashboardState?.pending_server_request}
-								Blocked on {dashboardState.pending_server_request.method}
-							{:else}
-								Raw event log: {trimMiddle(dashboardState?.event_log_path, 36, 18)}
-							{/if}
+				{#if workflowActive() || workflowPaused()}
+					<div class="grid gap-3">
+						<Textarea
+							bind:value={steerNote}
+							rows={4}
+							placeholder="Queue an operator steering note for the next Codex execution step."
+							class="resize-none text-[0.84rem] leading-6"
+							disabled={steeringRun}
+						/>
+						<div class="flex flex-wrap items-center justify-between gap-3">
+							<div class="text-[0.74rem] text-muted-foreground">
+								{#if requestError}
+									{requestError}
+								{:else if activeRun()?.pause_requested}
+									Pause requested; the run will pause after the current step.
+								{:else if activeRun()?.pending_steering_notes.length}
+									{activeRun()?.pending_steering_notes.length} steering note(s) queued.
+								{:else}
+									Steering applies on the next Codex execution step.
+								{/if}
+							</div>
+							<Button
+								disabled={!steerNote.trim() || steeringRun || !workflowActive()}
+								onclick={queueSteer}
+							>
+								{steeringRun ? "Queueing" : "Queue steer"}
+							</Button>
 						</div>
-						<Button
-							disabled={!prompt.trim() || sendingPrompt || !codexConnected()}
-							onclick={sendPrompt}
-						>
-							{sendingPrompt ? "Sending" : "Send prompt"}
-						</Button>
 					</div>
-				</div>
+				{:else}
+					<div class="text-[0.78rem] text-muted-foreground">
+						Workflow controls live in the right rail. When a run is active, this area becomes the
+						operator steering queue.
+					</div>
+				{/if}
 			</div>
 		</section>
 
-		<aside class="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]">
+		<aside class="grid min-h-0 grid-rows-[auto_auto_minmax(0,1fr)_minmax(0,1fr)]">
+			<div class="border-b border-border px-5 py-4">
+				<div class="text-[0.92rem] font-medium">Workflow Run</div>
+				<div class="mt-3 grid gap-3">
+					<div class="grid gap-2">
+						<label class="text-[0.72rem] text-muted-foreground" for="workflow-select">
+							Workflow
+						</label>
+						<select
+							id="workflow-select"
+							bind:value={selectedWorkflowId}
+							class="h-10 rounded-md border border-border bg-background px-3 text-[0.84rem] outline-none ring-0"
+							disabled={workflowActive()}
+						>
+							<option value="" disabled>Select a workflow</option>
+							{#each workflowCatalog?.workflows ?? [] as workflow}
+								<option value={workflow.id}>{workflow.id}</option>
+							{/each}
+						</select>
+					</div>
+					<div class="grid gap-2">
+						<label class="text-[0.72rem] text-muted-foreground" for="target-dir">Target directory</label>
+						<input
+							id="target-dir"
+							bind:value={targetDir}
+							class="h-10 rounded-md border border-border bg-background px-3 text-[0.84rem] outline-none"
+							disabled={workflowActive()}
+						/>
+					</div>
+					<div class="grid gap-2">
+						<label class="text-[0.72rem] text-muted-foreground" for="start-prompt">Starting prompt</label>
+						<Textarea
+							id="start-prompt"
+							bind:value={startPrompt}
+							rows={5}
+							placeholder="Describe the repo task you want the workflow to carry forward."
+							class="resize-none text-[0.84rem] leading-6"
+							disabled={workflowActive() || startingRun}
+						/>
+					</div>
+					<div class="flex flex-wrap items-center justify-between gap-3">
+						<div class="text-[0.73rem] text-muted-foreground">
+							{#if workflowCatalog?.loaded}
+								Config: {trimMiddle(workflowCatalog.config_path, 24, 18)}
+							{:else if workflowCatalog?.error}
+								{workflowCatalog.error}
+							{:else}
+								Loading workflow catalog…
+							{/if}
+						</div>
+						<Button
+							disabled={
+								!workflowCatalog?.loaded ||
+								workflowActive() ||
+								!selectedWorkflowId ||
+								!targetDir.trim() ||
+								!startPrompt.trim() ||
+								startingRun
+							}
+							onclick={startWorkflowRun}
+						>
+							{startingRun ? "Starting run" : "Start run"}
+						</Button>
+					</div>
+					{#if selectedWorkflow()}
+						<div class="grid gap-2 border-t border-border pt-3 text-[0.76rem] text-muted-foreground">
+							<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+								<div>Planner</div>
+								<div class="truncate text-foreground">{selectedWorkflow()?.planner_agent}</div>
+							</div>
+							<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+								<div>Judge</div>
+								<div class="truncate text-foreground">{selectedWorkflow()?.judge_agent}</div>
+							</div>
+							<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+								<div>Budgets</div>
+								<div class="truncate text-foreground">
+									{selectedWorkflow()?.max_loops} loops · {selectedWorkflow()?.max_judge_calls} judges · {selectedWorkflow()?.max_runtime_minutes} min
+								</div>
+							</div>
+						</div>
+					{/if}
+				</div>
+			</div>
+
 			<div class="border-b border-border px-5 py-3">
 				<div class="text-[0.92rem] font-medium">Session</div>
 				<div class="mt-3 grid gap-2 text-[0.78rem]">
-					<div class="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-3">
-						<div class="text-muted-foreground">Model</div>
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+						<div class="text-muted-foreground">Codex model</div>
 						<div class="truncate">{dashboardState?.thread?.model ?? "—"}</div>
 					</div>
-					<div class="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-3">
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">Sandbox</div>
 						<div class="truncate">{dashboardState?.thread?.sandbox_mode ?? "—"}</div>
 					</div>
-					<div class="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-3">
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">Approvals</div>
 						<div class="truncate">{dashboardState?.thread?.approval_policy ?? "—"}</div>
 					</div>
-					<div class="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-3">
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+						<div class="text-muted-foreground">Loop</div>
+						<div class="truncate text-foreground">
+							{#if activeRun()}
+								{activeRun()?.current_loop}/{activeRun()?.max_loops} · judge {activeRun()?.judge_calls}/{activeRun()?.max_judge_calls}
+							{:else}
+								—
+							{/if}
+						</div>
+					</div>
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+						<div class="text-muted-foreground">Started</div>
+						<div class="truncate text-foreground">{formatShortDateTime(activeRun()?.started_at)}</div>
+					</div>
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">MCP</div>
 						<div class="truncate">
 							{Object.entries(dashboardState?.mcp_servers ?? {})
@@ -566,12 +830,56 @@ onMount(() => {
 								.join(", ") || "—"}
 						</div>
 					</div>
+					{#if activeRun()?.last_judge_summary}
+						<div class="border-t border-border pt-2 text-[0.74rem] text-muted-foreground">
+							{activeRun()?.last_judge_decision}: {activeRun()?.last_judge_summary}
+						</div>
+					{/if}
+					{#if activeRun()?.last_error}
+						<div class="border-t border-border pt-2 text-[0.74rem] text-[#c97c6b]">
+							{activeRun()?.last_error}
+						</div>
+					{/if}
+				</div>
+			</div>
+
+			<div class="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] border-b border-border">
+				<div class="border-b border-border px-5 py-3">
+					<div class="text-[0.92rem] font-medium">Workflow activity</div>
+				</div>
+				<div
+					bind:this={workflowPane}
+					class="min-h-0 overflow-y-auto"
+					onscroll={() => updateScrollMode("workflow")}
+				>
+					{#if !recentWorkflowEvents.length}
+						<div class="px-5 py-6 text-[0.82rem] text-muted-foreground">
+							No workflow events captured yet.
+						</div>
+					{:else}
+						{#each recentWorkflowEvents as event (event.event_id)}
+							<div
+								transition:fade={{ duration: 120 }}
+								class="grid grid-cols-[5rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-3"
+							>
+								<div class="pt-0.5 text-[0.72rem] text-muted-foreground">
+									{formatClock(event.recorded_at)}
+								</div>
+								<div class="min-w-0">
+									<div class="truncate text-[0.77rem] text-foreground">{event.kind}</div>
+									<div class="mt-1 whitespace-pre-wrap break-words text-[0.73rem] text-muted-foreground">
+										{summarizeWorkflowEvent(event)}
+									</div>
+								</div>
+							</div>
+						{/each}
+					{/if}
 				</div>
 			</div>
 
 			<div class="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]">
 				<div class="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
-					<div class="text-[0.92rem] font-medium">Event stream</div>
+					<div class="text-[0.92rem] font-medium">Protocol stream</div>
 					<div class="flex items-center gap-2">
 						{#each ["coalesced", "important", "raw"] as mode}
 							<Button
@@ -586,7 +894,11 @@ onMount(() => {
 						{/each}
 					</div>
 				</div>
-				<div bind:this={eventPane} class="min-h-0 overflow-y-auto" onscroll={() => updateScrollMode('events')}>
+				<div
+					bind:this={eventPane}
+					class="min-h-0 overflow-y-auto"
+					onscroll={() => updateScrollMode("events")}
+				>
 					{#if !eventStreamEntries().length}
 						<div class="px-5 py-6 text-[0.82rem] text-muted-foreground">
 							No protocol events captured yet.

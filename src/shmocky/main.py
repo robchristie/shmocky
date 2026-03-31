@@ -6,30 +6,33 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from .bridge import CodexAppServerBridge
 from .models import (
     DashboardSnapshot,
     OracleQueryRequest,
     OracleQueryResponse,
     PromptRequest,
     StreamEnvelope,
+    WorkflowCatalogResponse,
+    WorkflowRunRequest,
+    WorkflowRunState,
+    WorkflowSteerRequest,
 )
 from .oracle_agent import OracleAgent, OracleAgentError, OracleNotConfiguredError
 from .settings import AppSettings
+from .supervisor import WorkflowSupervisor, as_http_error
 
 
 def create_app() -> FastAPI:
     settings = AppSettings()
-    bridge = CodexAppServerBridge(settings)
+    supervisor = WorkflowSupervisor(settings)
     oracle = OracleAgent(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        await bridge.start()
         try:
             yield
         finally:
-            await bridge.stop()
+            await supervisor.shutdown()
 
     app = FastAPI(title="Shmocky", lifespan=lifespan)
     app.add_middleware(
@@ -41,30 +44,51 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> dict[str, object]:
-        snapshot = bridge.snapshot()
+        snapshot = supervisor.snapshot()
+        catalog = supervisor.workflows_catalog()
         return {
             "backendOnline": snapshot.state.connection.backend_online,
             "codexConnected": snapshot.state.connection.codex_connected,
             "initialized": snapshot.state.connection.initialized,
             "oracleConfigured": oracle.is_configured(),
             "oracleRemoteHost": settings.oracle_remote_host,
+            "workflowConfigLoaded": catalog.loaded,
+            "workflowConfigPath": catalog.config_path,
+            "workflowConfigError": catalog.error,
         }
 
     @app.get("/api/state", response_model=DashboardSnapshot)
     async def state() -> DashboardSnapshot:
-        return bridge.snapshot()
+        return supervisor.snapshot()
+
+    @app.get("/api/workflows", response_model=WorkflowCatalogResponse)
+    async def workflows() -> WorkflowCatalogResponse:
+        return supervisor.workflows_catalog()
+
+    @app.get("/api/runs/active", response_model=WorkflowRunState | None)
+    async def active_run() -> WorkflowRunState | None:
+        return supervisor.snapshot().state.workflow_run
 
     @app.post("/api/thread/start", response_model=DashboardSnapshot)
     async def start_thread() -> DashboardSnapshot:
-        return await bridge.ensure_thread()
+        try:
+            return await supervisor.start_thread()
+        except Exception as exc:
+            raise as_http_error(exc) from exc
 
     @app.post("/api/turns", response_model=DashboardSnapshot)
     async def create_turn(payload: PromptRequest) -> DashboardSnapshot:
-        return await bridge.start_turn(payload.prompt)
+        try:
+            return await supervisor.send_prompt(payload.prompt)
+        except Exception as exc:
+            raise as_http_error(exc) from exc
 
     @app.post("/api/turns/interrupt", response_model=DashboardSnapshot)
     async def interrupt_turn() -> DashboardSnapshot:
-        return await bridge.interrupt_turn()
+        try:
+            return await supervisor.interrupt_turn()
+        except Exception as exc:
+            raise as_http_error(exc) from exc
 
     @app.post("/api/oracle/query", response_model=OracleQueryResponse)
     async def oracle_query(payload: OracleQueryRequest) -> OracleQueryResponse:
@@ -75,15 +99,52 @@ def create_app() -> FastAPI:
         except OracleAgentError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.post("/api/runs", response_model=DashboardSnapshot)
+    async def start_run(payload: WorkflowRunRequest) -> DashboardSnapshot:
+        try:
+            return await supervisor.start_run(payload)
+        except Exception as exc:
+            raise as_http_error(exc) from exc
+
+    @app.post("/api/runs/active/pause", response_model=DashboardSnapshot)
+    async def pause_run() -> DashboardSnapshot:
+        try:
+            return await supervisor.pause_run()
+        except Exception as exc:
+            raise as_http_error(exc) from exc
+
+    @app.post("/api/runs/active/resume", response_model=DashboardSnapshot)
+    async def resume_run() -> DashboardSnapshot:
+        try:
+            return await supervisor.resume_run()
+        except Exception as exc:
+            raise as_http_error(exc) from exc
+
+    @app.post("/api/runs/active/stop", response_model=DashboardSnapshot)
+    async def stop_run() -> DashboardSnapshot:
+        try:
+            return await supervisor.stop_run()
+        except Exception as exc:
+            raise as_http_error(exc) from exc
+
+    @app.post("/api/runs/active/steer", response_model=DashboardSnapshot)
+    async def steer_run(payload: WorkflowSteerRequest) -> DashboardSnapshot:
+        try:
+            return await supervisor.steer_run(payload)
+        except Exception as exc:
+            raise as_http_error(exc) from exc
+
     @app.websocket("/api/events")
     async def events(websocket: WebSocket) -> None:
         await websocket.accept()
-        queue = await bridge.subscribe()
+        queue = await supervisor.subscribe()
         try:
             await websocket.send_json(
                 StreamEnvelope(
                     type="state",
-                    state=bridge.snapshot().state,
+                    state=supervisor.snapshot().state,
+                    event=None,
+                    workflow_event=None,
                 ).model_dump(mode="json"),
             )
             while True:
@@ -92,7 +153,7 @@ def create_app() -> FastAPI:
         except WebSocketDisconnect:
             return
         finally:
-            bridge.unsubscribe(queue)
+            supervisor.unsubscribe(queue)
 
     return app
 

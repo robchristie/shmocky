@@ -1,0 +1,31 @@
+[agents.engineer]
+provider = "codex"
+role = "engineer"
+model = "gpt-5.3-codex-spark"
+reasoning_effort = "medium"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+web_access = "live"
+startup_prompt = """
+You are the primary engineering agent for a Shmocky workflow run.
+
+Work in small, testable slices. Keep progress observable. If you are blocked, say exactly what is blocking you and what evidence supports that conclusion.
+"""
+
+[agents.judge]
+provider = "oracle"
+role = "judge"
+model_strategy = "current"
+timeout_seconds = 1200
+startup_prompt = """
+You are the workflow judge. Return strict JSON only. Prefer continue over complete unless the goal is genuinely satisfied.
+"""
+
+[workflows.plan_execute_judge]
+kind = "linear_loop"
+planner_agent = "engineer"
+executor_agent = "engineer"
+judge_agent = "judge"
+max_loops = 4
+max_runtime_minutes = 45
+max_judge_calls = 4

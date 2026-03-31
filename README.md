@@ -2,7 +2,7 @@
 
 Shmocky is a thin browser wrapper around `codex app-server`.
 
-This repository is intentionally starting small. The first shipped slice gives you a
+This repository is intentionally starting small. The current slice gives you a
 single-user control surface with:
 
 - a FastAPI backend that starts and manages one `codex app-server` subprocess
@@ -15,9 +15,10 @@ single-user control surface with:
 Implemented:
 
 - backend startup and `initialize` handshake with `codex app-server`
-- one active workspace thread
-- prompt submission through `turn/start`
-- turn interruption through `turn/interrupt`
+- one active workflow run at a time, driven by repo-local TOML config
+- one long-lived Codex thread per workflow run
+- Oracle judging through a structured sidecar loop
+- pause, resume, stop, and steer controls from the browser
 - one-at-a-time Oracle consults through `POST /api/oracle/query`
 - websocket fanout for browser observability
 - file-backed raw event persistence before projection updates
@@ -25,6 +26,7 @@ Implemented:
 Not implemented yet:
 
 - approvals and tool/user-input request handling in the browser
+- general graph execution, multi-run scheduling, repo cloning, or browser-side workflow editing
 - multi-thread management, resume, fork, archive, or notebook projections
 - auth, budgets, policy gates, or multi-user tenancy
 
@@ -64,8 +66,35 @@ The helper scripts in `scripts/` default to:
 - Vite allowed hosts set from `SHMOCKY_ALLOWED_HOSTS` or, by default in `scripts/run-frontend.sh`, `*` for remote dev access
 
 Then open the Vite URL in a browser. The header should show backend and Codex connectivity,
-and the main workspace should let you start a thread, send prompts, interrupt turns, and inspect
-the raw event stream.
+and the main workspace should let you select a workflow, point it at a local target directory,
+launch a run, inspect Codex transcript plus workflow activity, and pause, resume, stop, or steer.
+
+## Workflow Config
+
+Shmocky reads workflow and agent definitions from `shmocky.toml` in the repo root.
+
+The current built-in config ships one default workflow:
+
+- `plan_execute_judge`
+
+The current workflow shape is intentionally narrow:
+
+- repo-local TOML config
+- one active run at a time
+- one Codex planner or executor thread per run
+- one Oracle judge that returns strict JSON decisions
+
+The backend exposes:
+
+- `GET /api/workflows`
+- `POST /api/runs`
+- `GET /api/runs/active`
+- `POST /api/runs/active/pause`
+- `POST /api/runs/active/resume`
+- `POST /api/runs/active/stop`
+- `POST /api/runs/active/steer`
+
+The browser is the primary way to use these, but the endpoints are available for smoke tests and automation.
 
 ## Oracle Sidecar
 

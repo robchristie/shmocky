@@ -25,11 +25,30 @@ class OracleAgent:
     def is_configured(self) -> bool:
         return self._settings.oracle_remote_token is not None
 
-    async def query(self, request: OracleQueryRequest) -> OracleQueryResponse:
+    async def query(
+        self,
+        request: OracleQueryRequest,
+        *,
+        remote_host: str | None = None,
+        model_strategy: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> OracleQueryResponse:
         async with self._lock:
-            return await self._run_query(request)
+            return await self._run_query(
+                request,
+                remote_host=remote_host,
+                model_strategy=model_strategy,
+                timeout_seconds=timeout_seconds,
+            )
 
-    async def _run_query(self, request: OracleQueryRequest) -> OracleQueryResponse:
+    async def _run_query(
+        self,
+        request: OracleQueryRequest,
+        *,
+        remote_host: str | None,
+        model_strategy: str | None,
+        timeout_seconds: float | None,
+    ) -> OracleQueryResponse:
         token = self._settings.oracle_remote_token
         if token is None:
             raise OracleNotConfiguredError(
@@ -38,6 +57,13 @@ class OracleAgent:
 
         attached_files = self._resolve_files(request.files)
         output_path = self._allocate_output_path()
+        effective_remote_host = self._settings._normalize_oracle_remote_host(
+            remote_host or self._settings.oracle_remote_host
+        )
+        effective_model_strategy = (
+            model_strategy or self._settings.oracle_browser_model_strategy
+        )
+        effective_timeout_seconds = timeout_seconds or self._settings.oracle_timeout_seconds
         command = [
             self._settings.oracle_cli_command,
             "-y",
@@ -45,11 +71,11 @@ class OracleAgent:
             "--engine",
             self._settings.oracle_engine,
             "--remote-host",
-            self._settings.oracle_remote_host,
+            effective_remote_host,
             "--remote-token",
             token.get_secret_value(),
             "--browser-model-strategy",
-            self._settings.oracle_browser_model_strategy,
+            effective_model_strategy,
             "--write-output",
             str(output_path),
         ]
@@ -67,13 +93,13 @@ class OracleAgent:
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 process.communicate(),
-                timeout=self._settings.oracle_timeout_seconds,
+                timeout=effective_timeout_seconds,
             )
         except TimeoutError as exc:
             process.kill()
             await process.wait()
             raise OracleAgentError(
-                f"Oracle query timed out after {self._settings.oracle_timeout_seconds:.0f}s."
+                f"Oracle query timed out after {effective_timeout_seconds:.0f}s."
             ) from exc
 
         duration_seconds = monotonic() - started_at
@@ -89,7 +115,7 @@ class OracleAgent:
 
         return OracleQueryResponse(
             answer=answer,
-            remote_host=self._settings.oracle_remote_host,
+            remote_host=effective_remote_host,
             duration_seconds=duration_seconds,
             attached_files=attached_files,
             stderr=stderr_text or None,

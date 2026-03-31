@@ -16,6 +16,32 @@ type EventMessageType = Literal[
     "lifecycle",
     "unknown",
 ]
+type ApprovalPolicy = Literal["untrusted", "on-failure", "on-request", "never"]
+type SandboxMode = Literal["read-only", "workspace-write", "danger-full-access"]
+type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+type WebAccessMode = Literal["disabled", "cached", "live"]
+type AgentProvider = Literal["codex", "oracle"]
+type WorkflowKind = Literal["linear_loop"]
+type WorkflowDecisionType = Literal["continue", "complete", "fail"]
+type WorkflowRunStatus = Literal[
+    "idle",
+    "starting",
+    "running",
+    "paused",
+    "completed",
+    "failed",
+    "stopped",
+]
+type WorkflowPhase = Literal[
+    "idle",
+    "planning",
+    "executing",
+    "judging",
+    "paused",
+    "completed",
+    "failed",
+    "stopped",
+]
 
 
 class ConnectionState(BaseModel):
@@ -75,6 +101,7 @@ class DashboardState(BaseModel):
     mcp_servers: dict[str, str] = Field(default_factory=dict)
     rate_limits: dict[str, Any] | None = None
     pending_server_request: PendingServerRequest | None = None
+    workflow_run: "WorkflowRunState | None" = None
 
 
 class RawEventRecord(BaseModel):
@@ -91,12 +118,14 @@ class RawEventRecord(BaseModel):
 class DashboardSnapshot(BaseModel):
     state: DashboardState
     recent_events: list[RawEventRecord] = Field(default_factory=list)
+    recent_workflow_events: list["WorkflowEventRecord"] = Field(default_factory=list)
 
 
 class StreamEnvelope(BaseModel):
-    type: Literal["event", "state"]
+    type: Literal["event", "workflow_event", "state"]
     state: DashboardState
     event: RawEventRecord | None = None
+    workflow_event: "WorkflowEventRecord | None" = None
 
 
 class PromptRequest(BaseModel):
@@ -114,3 +143,120 @@ class OracleQueryResponse(BaseModel):
     duration_seconds: float
     attached_files: list[str] = Field(default_factory=list)
     stderr: str | None = None
+
+
+class CodexAgentConfig(BaseModel):
+    role: str
+    startup_prompt: str | None = None
+    description: str | None = None
+    model: str | None = None
+    model_provider: str | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    approval_policy: ApprovalPolicy = "never"
+    sandbox_mode: SandboxMode = "workspace-write"
+    web_access: WebAccessMode = "disabled"
+    service_tier: Literal["fast", "flex"] | None = None
+
+
+class OracleAgentConfig(BaseModel):
+    role: str
+    startup_prompt: str | None = None
+    description: str | None = None
+    remote_host: str | None = None
+    model_strategy: Literal["current", "ignore"] = "current"
+    timeout_seconds: float | None = None
+
+
+class AgentDefinition(BaseModel):
+    id: str
+    provider: AgentProvider
+    role: str
+    startup_prompt: str | None = None
+    description: str | None = None
+    model: str | None = None
+    model_provider: str | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    approval_policy: ApprovalPolicy | None = None
+    sandbox_mode: SandboxMode | None = None
+    web_access: WebAccessMode | None = None
+    service_tier: Literal["fast", "flex"] | None = None
+    remote_host: str | None = None
+    model_strategy: Literal["current", "ignore"] | None = None
+    timeout_seconds: float | None = None
+
+
+class WorkflowDefinition(BaseModel):
+    id: str
+    kind: WorkflowKind = "linear_loop"
+    planner_agent: str
+    executor_agent: str
+    judge_agent: str
+    plan_prompt_template: str
+    execute_prompt_template: str
+    judge_prompt_template: str
+    max_loops: int = Field(default=4, ge=1, le=100)
+    max_runtime_minutes: int = Field(default=30, ge=1, le=24 * 60)
+    max_judge_calls: int = Field(default=4, ge=1, le=100)
+
+
+class WorkflowCatalogResponse(BaseModel):
+    config_path: str
+    loaded: bool
+    error: str | None = None
+    agents: list[AgentDefinition] = Field(default_factory=list)
+    workflows: list[WorkflowDefinition] = Field(default_factory=list)
+
+
+class WorkflowRunRequest(BaseModel):
+    workflow_id: str = Field(min_length=1, max_length=200)
+    target_dir: str = Field(min_length=1, max_length=4_000)
+    prompt: str = Field(min_length=1, max_length=20_000)
+
+
+class WorkflowSteerRequest(BaseModel):
+    note: str = Field(min_length=1, max_length=8_000)
+
+
+class JudgeDecision(BaseModel):
+    decision: WorkflowDecisionType
+    summary: str = Field(min_length=1, max_length=8_000)
+    next_prompt: str | None = Field(default=None, max_length=20_000)
+    completion_note: str | None = Field(default=None, max_length=8_000)
+    failure_reason: str | None = Field(default=None, max_length=8_000)
+
+
+class WorkflowRunState(BaseModel):
+    id: str
+    workflow_id: str
+    target_dir: str
+    goal: str
+    status: WorkflowRunStatus = "starting"
+    phase: WorkflowPhase = "idle"
+    codex_agent_id: str
+    judge_agent_id: str
+    started_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    current_loop: int = 0
+    max_loops: int
+    judge_calls: int = 0
+    max_judge_calls: int
+    max_runtime_minutes: int
+    last_plan: str | None = None
+    last_codex_output: str | None = None
+    last_judge_decision: WorkflowDecisionType | None = None
+    last_judge_summary: str | None = None
+    last_error: str | None = None
+    pause_requested: bool = False
+    stop_requested: bool = False
+    pending_steering_notes: list[str] = Field(default_factory=list)
+    recent_steering_notes: list[str] = Field(default_factory=list)
+
+
+class WorkflowEventRecord(BaseModel):
+    sequence: int
+    event_id: str
+    recorded_at: datetime
+    kind: str
+    message: str
+    payload: Any = None

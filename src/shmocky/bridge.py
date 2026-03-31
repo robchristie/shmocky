@@ -10,6 +10,7 @@ from typing import Any
 
 from .event_store import RawEventStore
 from .models import (
+    CodexAgentConfig,
     DashboardSnapshot,
     EventChannel,
     EventDirection,
@@ -26,12 +27,22 @@ class BridgeError(RuntimeError):
 
 
 class CodexAppServerBridge:
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(
+        self,
+        settings: AppSettings,
+        *,
+        workspace_root: Path | None = None,
+        event_log_dir: Path | None = None,
+        agent_config: CodexAgentConfig | None = None,
+    ) -> None:
         self._settings = settings
-        event_log_path = self._make_event_log_path(settings.event_log_dir)
+        self._workspace_root = (workspace_root or settings.workspace_root).expanduser().resolve()
+        self._agent_config = agent_config or CodexAgentConfig(role="engineer")
+        event_log_root = event_log_dir or settings.event_log_dir
+        event_log_path = self._make_event_log_path(event_log_root)
         self._event_store = RawEventStore(event_log_path)
         self._projection = SessionProjection(
-            workspace_root=str(settings.workspace_root),
+            workspace_root=str(self._workspace_root),
             event_log_path=str(event_log_path),
         )
         self._recent_events: deque[RawEventRecord] = deque(maxlen=300)
@@ -49,7 +60,7 @@ class CodexAppServerBridge:
         self._process = await asyncio.create_subprocess_exec(
             self._settings.codex_command,
             "app-server",
-            cwd=str(self._settings.workspace_root),
+            cwd=str(self._workspace_root),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -101,12 +112,22 @@ class CodexAppServerBridge:
         async with self._thread_lock:
             state = self._projection.snapshot()
             if state.thread is None:
+                config: dict[str, Any] = {}
+                if self._agent_config.reasoning_effort is not None:
+                    config["model_reasoning_effort"] = self._agent_config.reasoning_effort
+                if self._agent_config.web_access is not None:
+                    config["web_search"] = self._agent_config.web_access
                 await self._call(
                     "thread/start",
                     {
-                        "cwd": str(self._settings.workspace_root),
-                        "approvalPolicy": self._settings.approval_policy,
-                        "sandbox": self._settings.sandbox_mode,
+                        "cwd": str(self._workspace_root),
+                        "approvalPolicy": self._agent_config.approval_policy,
+                        "sandbox": self._agent_config.sandbox_mode,
+                        "developerInstructions": self._agent_config.startup_prompt,
+                        "model": self._agent_config.model,
+                        "modelProvider": self._agent_config.model_provider,
+                        "serviceTier": self._agent_config.service_tier,
+                        "config": config or None,
                         "experimentalRawEvents": False,
                         "persistExtendedHistory": True,
                     },
@@ -144,6 +165,25 @@ class CodexAppServerBridge:
             },
         )
         return self.snapshot()
+
+    async def wait_for_turn_completion(self, turn_id: str) -> DashboardSnapshot:
+        queue = await self.subscribe()
+        try:
+            while True:
+                snapshot = self.snapshot()
+                if self._is_terminal_turn(snapshot, turn_id):
+                    return snapshot
+                envelope = await queue.get()
+                if self._is_terminal_turn(
+                    DashboardSnapshot(
+                        state=envelope.state,
+                        recent_events=[],
+                    ),
+                    turn_id,
+                ):
+                    return self.snapshot()
+        finally:
+            self.unsubscribe(queue)
 
     async def subscribe(self) -> asyncio.Queue[StreamEnvelope]:
         queue: asyncio.Queue[StreamEnvelope] = asyncio.Queue(maxsize=512)
@@ -322,3 +362,10 @@ class CodexAppServerBridge:
     def _make_event_log_path(directory: Path) -> Path:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         return directory / f"codex-app-server-{timestamp}.jsonl"
+
+    @staticmethod
+    def _is_terminal_turn(snapshot: DashboardSnapshot, turn_id: str) -> bool:
+        turn = snapshot.state.turn
+        if turn is None or turn.id != turn_id:
+            return False
+        return turn.status in {"completed", "failed", "cancelled", "interrupted"}
