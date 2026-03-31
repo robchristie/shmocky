@@ -23,6 +23,7 @@ type EventStreamEntry = {
 };
 
 type EventStreamMode = "coalesced" | "important" | "raw";
+type OperatorRailTab = "run" | "activity" | "protocol";
 
 let dashboardState: DashboardState | null = $state(null);
 let workflowCatalog: WorkflowCatalogResponse | null = $state(null);
@@ -47,6 +48,7 @@ let autoScrollTranscript = $state(true);
 let autoScrollWorkflowEvents = $state(true);
 let autoScrollEvents = $state(true);
 let eventStreamMode: EventStreamMode = $state("important");
+let operatorRailTab: OperatorRailTab = $state("run");
 let reconnectTimer: number | null = null;
 let socket: WebSocket | null = null;
 
@@ -705,95 +707,7 @@ onMount(() => {
 			</div>
 		</section>
 
-		<aside class="grid min-h-0 grid-rows-[auto_auto_minmax(0,1fr)_minmax(0,1fr)]">
-			<div class="border-b border-border px-5 py-4">
-				<div class="text-[0.92rem] font-medium">Workflow Run</div>
-				<div class="mt-3 grid gap-3">
-					<div class="grid gap-2">
-						<label class="text-[0.72rem] text-muted-foreground" for="workflow-select">
-							Workflow
-						</label>
-						<select
-							id="workflow-select"
-							bind:value={selectedWorkflowId}
-							class="h-10 rounded-md border border-border bg-background px-3 text-[0.84rem] outline-none ring-0"
-							disabled={workflowActive()}
-						>
-							<option value="" disabled>Select a workflow</option>
-							{#each workflowCatalog?.workflows ?? [] as workflow}
-								<option value={workflow.id}>{workflow.id}</option>
-							{/each}
-						</select>
-					</div>
-					<div class="grid gap-2">
-						<label class="text-[0.72rem] text-muted-foreground" for="target-dir">Target directory</label>
-						<input
-							id="target-dir"
-							bind:value={targetDir}
-							placeholder="/absolute/path/to/repository-or-standalone-workdir"
-							class="h-10 rounded-md border border-border bg-background px-3 text-[0.84rem] outline-none"
-							disabled={workflowActive()}
-						/>
-					</div>
-					<div class="grid gap-2">
-						<label class="text-[0.72rem] text-muted-foreground" for="start-prompt">Starting prompt</label>
-						<Textarea
-							id="start-prompt"
-							bind:value={startPrompt}
-							rows={5}
-							placeholder="Describe the repo task you want the workflow to carry forward."
-							class="resize-none text-[0.84rem] leading-6"
-							disabled={workflowActive() || startingRun}
-						/>
-					</div>
-					<div class="flex flex-wrap items-center justify-between gap-3">
-						<div class="text-[0.73rem] text-muted-foreground">
-							{#if workflowCatalog?.loaded}
-								Config: {trimMiddle(workflowCatalog.config_path, 24, 18)}
-							{:else if workflowCatalog?.error}
-								{workflowCatalog.error}
-							{:else}
-								Loading workflow catalog…
-							{/if}
-						</div>
-						<Button
-							disabled={
-								!workflowCatalog?.loaded ||
-								workflowActive() ||
-								!selectedWorkflowId ||
-								!targetDir.trim() ||
-								!startPrompt.trim() ||
-								startingRun
-							}
-							onclick={startWorkflowRun}
-						>
-							{startingRun ? "Starting run" : "Start run"}
-						</Button>
-					</div>
-					{#if selectedWorkflow()}
-						<div class="grid gap-2 border-t border-border pt-3 text-[0.76rem] text-muted-foreground">
-							<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
-								<div>Planner</div>
-								<div class="truncate text-foreground">{selectedWorkflow()?.planner_agent}</div>
-							</div>
-							<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
-								<div>Judge</div>
-								<div class="truncate text-foreground">{selectedWorkflow()?.judge_agent}</div>
-							</div>
-							<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
-								<div>Budgets</div>
-								<div class="truncate text-foreground">
-									{selectedWorkflow()?.max_loops} loops · {selectedWorkflow()?.max_judge_calls} judges · {selectedWorkflow()?.max_runtime_minutes} min
-								</div>
-							</div>
-							<div class="border-t border-border pt-2 text-[0.72rem]">
-								Use a repository root or a standalone directory outside the Shmocky repo. Nested paths inside another repo are rejected for isolation.
-							</div>
-						</div>
-					{/if}
-				</div>
-			</div>
-
+		<aside class="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]">
 			<div class="border-b border-border px-5 py-3">
 				<div class="text-[0.92rem] font-medium">Session</div>
 				<div class="mt-3 grid gap-2 text-[0.78rem]">
@@ -844,90 +758,225 @@ onMount(() => {
 				</div>
 			</div>
 
-			<div class="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] border-b border-border">
-				<div class="border-b border-border px-5 py-3">
-					<div class="text-[0.92rem] font-medium">Workflow activity</div>
-				</div>
-				<div
-					bind:this={workflowPane}
-					class="min-h-0 overflow-y-auto"
-					onscroll={() => updateScrollMode("workflow")}
-				>
-					{#if !recentWorkflowEvents.length}
-						<div class="px-5 py-6 text-[0.82rem] text-muted-foreground">
-							No workflow events captured yet.
-						</div>
-					{:else}
-						{#each recentWorkflowEvents as event (event.event_id)}
-							<div
-								transition:fade={{ duration: 120 }}
-								class="grid grid-cols-[5rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-3"
-							>
-								<div class="pt-0.5 text-[0.72rem] text-muted-foreground">
-									{formatClock(event.recorded_at)}
-								</div>
-								<div class="min-w-0">
-									<div class="truncate text-[0.77rem] text-foreground">{event.kind}</div>
-									<div class="mt-1 whitespace-pre-wrap break-words text-[0.73rem] text-muted-foreground">
-										{summarizeWorkflowEvent(event)}
-									</div>
-								</div>
-							</div>
-						{/each}
-					{/if}
-				</div>
-			</div>
-
-			<div class="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]">
-				<div class="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
-					<div class="text-[0.92rem] font-medium">Protocol stream</div>
-					<div class="flex items-center gap-2">
-						{#each ["coalesced", "important", "raw"] as mode}
-							<Button
-								variant={eventStreamMode === mode ? "secondary" : "outline"}
-								size="xs"
-								onclick={() => {
-									eventStreamMode = mode as EventStreamMode;
-								}}
-							>
-								{mode}
-							</Button>
-						{/each}
+			<div class="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] border-t border-border">
+				<div class="flex flex-wrap items-end justify-between gap-4 border-b border-border px-5 py-3">
+					<div class="flex items-center gap-5">
+						<button
+							type="button"
+							class={`border-b pb-2 text-[0.84rem] transition-colors ${
+								operatorRailTab === "run"
+									? "border-foreground text-foreground"
+									: "border-transparent text-muted-foreground hover:text-foreground"
+							}`}
+							onclick={() => {
+								operatorRailTab = "run";
+							}}
+						>
+							Workflow run
+						</button>
+						<button
+							type="button"
+							class={`border-b pb-2 text-[0.84rem] transition-colors ${
+								operatorRailTab === "activity"
+									? "border-foreground text-foreground"
+									: "border-transparent text-muted-foreground hover:text-foreground"
+							}`}
+							onclick={() => {
+								operatorRailTab = "activity";
+							}}
+						>
+							Workflow activity
+						</button>
+						<button
+							type="button"
+							class={`border-b pb-2 text-[0.84rem] transition-colors ${
+								operatorRailTab === "protocol"
+									? "border-foreground text-foreground"
+									: "border-transparent text-muted-foreground hover:text-foreground"
+							}`}
+							onclick={() => {
+								operatorRailTab = "protocol";
+							}}
+						>
+							Protocol stream
+						</button>
 					</div>
-				</div>
-				<div
-					bind:this={eventPane}
-					class="min-h-0 overflow-y-auto"
-					onscroll={() => updateScrollMode("events")}
-				>
-					{#if !eventStreamEntries().length}
-						<div class="px-5 py-6 text-[0.82rem] text-muted-foreground">
-							No protocol events captured yet.
+					{#if operatorRailTab === "protocol"}
+						<div class="flex items-center gap-2">
+							{#each ["coalesced", "important", "raw"] as mode}
+								<Button
+									variant={eventStreamMode === mode ? "secondary" : "outline"}
+									size="xs"
+									onclick={() => {
+										eventStreamMode = mode as EventStreamMode;
+									}}
+								>
+									{mode}
+								</Button>
+							{/each}
+						</div>
+					{:else if operatorRailTab === "run"}
+						<div class="text-[0.73rem] text-muted-foreground">
+							Launch a workflow against a target repository or workdir.
 						</div>
 					{:else}
-						{#each eventStreamEntries() as event (event.id)}
-							<div
-								transition:fade={{ duration: 120 }}
-								class="grid grid-cols-[5rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-3"
-							>
-								<div class="pt-0.5 text-[0.72rem] text-muted-foreground">
-									{formatClock(event.recordedAt)}
-								</div>
-								<div class="min-w-0">
-									<div class="truncate text-[0.77rem] text-foreground">
-										{event.method ?? event.messageType}
-										{#if event.chunkCount > 1}
-											<span class="text-muted-foreground"> · {event.chunkCount} chunks</span>
-										{/if}
-									</div>
-									<div class="mt-1 whitespace-pre-wrap break-words text-[0.73rem] text-muted-foreground">
-										{event.summary}
-									</div>
-								</div>
-							</div>
-						{/each}
+						<div class="text-[0.73rem] text-muted-foreground">
+							Phase changes, judge decisions, steering, and run exits.
+						</div>
 					{/if}
 				</div>
+
+				{#if operatorRailTab === "run"}
+					<div class="min-h-0 overflow-y-auto px-5 py-4">
+						<div class="grid gap-3">
+							<div class="grid gap-2">
+								<label class="text-[0.72rem] text-muted-foreground" for="workflow-select">
+									Workflow
+								</label>
+								<select
+									id="workflow-select"
+									bind:value={selectedWorkflowId}
+									class="h-10 rounded-md border border-border bg-background px-3 text-[0.84rem] outline-none ring-0"
+									disabled={workflowActive()}
+								>
+									<option value="" disabled>Select a workflow</option>
+									{#each workflowCatalog?.workflows ?? [] as workflow}
+										<option value={workflow.id}>{workflow.id}</option>
+									{/each}
+								</select>
+							</div>
+							<div class="grid gap-2">
+								<label class="text-[0.72rem] text-muted-foreground" for="target-dir">Target directory</label>
+								<input
+									id="target-dir"
+									bind:value={targetDir}
+									placeholder="/absolute/path/to/repository-or-standalone-workdir"
+									class="h-10 rounded-md border border-border bg-background px-3 text-[0.84rem] outline-none"
+									disabled={workflowActive()}
+								/>
+							</div>
+							<div class="grid gap-2">
+								<label class="text-[0.72rem] text-muted-foreground" for="start-prompt">Starting prompt</label>
+								<Textarea
+									id="start-prompt"
+									bind:value={startPrompt}
+									rows={5}
+									placeholder="Describe the repo task you want the workflow to carry forward."
+									class="resize-none text-[0.84rem] leading-6"
+									disabled={workflowActive() || startingRun}
+								/>
+							</div>
+							<div class="flex flex-wrap items-center justify-between gap-3">
+								<div class="text-[0.73rem] text-muted-foreground">
+									{#if workflowCatalog?.loaded}
+										Config: {trimMiddle(workflowCatalog.config_path, 24, 18)}
+									{:else if workflowCatalog?.error}
+										{workflowCatalog.error}
+									{:else}
+										Loading workflow catalog…
+									{/if}
+								</div>
+								<Button
+									disabled={
+										!workflowCatalog?.loaded ||
+										workflowActive() ||
+										!selectedWorkflowId ||
+										!targetDir.trim() ||
+										!startPrompt.trim() ||
+										startingRun
+									}
+									onclick={startWorkflowRun}
+								>
+									{startingRun ? "Starting run" : "Start run"}
+								</Button>
+							</div>
+							{#if selectedWorkflow()}
+								<div class="grid gap-2 border-t border-border pt-3 text-[0.76rem] text-muted-foreground">
+									<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+										<div>Planner</div>
+										<div class="truncate text-foreground">{selectedWorkflow()?.planner_agent}</div>
+									</div>
+									<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+										<div>Judge</div>
+										<div class="truncate text-foreground">{selectedWorkflow()?.judge_agent}</div>
+									</div>
+									<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+										<div>Budgets</div>
+										<div class="truncate text-foreground">
+											{selectedWorkflow()?.max_loops} loops · {selectedWorkflow()?.max_judge_calls} judges · {selectedWorkflow()?.max_runtime_minutes} min
+										</div>
+									</div>
+									<div class="border-t border-border pt-2 text-[0.72rem]">
+										Use a repository root or a standalone directory outside the Shmocky repo. Nested paths inside another repo are rejected for isolation.
+									</div>
+								</div>
+							{/if}
+						</div>
+					</div>
+				{:else if operatorRailTab === "activity"}
+					<div
+						bind:this={workflowPane}
+						class="min-h-0 overflow-y-auto"
+						onscroll={() => updateScrollMode("workflow")}
+					>
+						{#if !recentWorkflowEvents.length}
+							<div class="px-5 py-6 text-[0.82rem] text-muted-foreground">
+								No workflow events captured yet.
+							</div>
+						{:else}
+							{#each recentWorkflowEvents as event (event.event_id)}
+								<div
+									transition:fade={{ duration: 120 }}
+									class="grid grid-cols-[5rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-3"
+								>
+									<div class="pt-0.5 text-[0.72rem] text-muted-foreground">
+										{formatClock(event.recorded_at)}
+									</div>
+									<div class="min-w-0">
+										<div class="truncate text-[0.77rem] text-foreground">{event.kind}</div>
+										<div class="mt-1 whitespace-pre-wrap break-words text-[0.73rem] text-muted-foreground">
+											{summarizeWorkflowEvent(event)}
+										</div>
+									</div>
+								</div>
+							{/each}
+						{/if}
+					</div>
+				{:else}
+					<div
+						bind:this={eventPane}
+						class="min-h-0 overflow-y-auto"
+						onscroll={() => updateScrollMode("events")}
+					>
+						{#if !eventStreamEntries().length}
+							<div class="px-5 py-6 text-[0.82rem] text-muted-foreground">
+								No protocol events captured yet.
+							</div>
+						{:else}
+							{#each eventStreamEntries() as event (event.id)}
+								<div
+									transition:fade={{ duration: 120 }}
+									class="grid grid-cols-[5rem_minmax(0,1fr)] gap-4 border-b border-border px-5 py-3"
+								>
+									<div class="pt-0.5 text-[0.72rem] text-muted-foreground">
+										{formatClock(event.recordedAt)}
+									</div>
+									<div class="min-w-0">
+										<div class="truncate text-[0.77rem] text-foreground">
+											{event.method ?? event.messageType}
+											{#if event.chunkCount > 1}
+												<span class="text-muted-foreground"> · {event.chunkCount} chunks</span>
+											{/if}
+										</div>
+										<div class="mt-1 whitespace-pre-wrap break-words text-[0.73rem] text-muted-foreground">
+											{event.summary}
+										</div>
+									</div>
+								</div>
+							{/each}
+						{/if}
+					</div>
+				{/if}
 			</div>
 		</aside>
 	</main>

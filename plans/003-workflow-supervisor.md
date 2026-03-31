@@ -83,3 +83,4 @@ Frontend:
 - 2026-03-31: Smoke testing surfaced a real template-rendering bug with literal JSON braces in judge prompts; prompt rendering now replaces only known placeholders and leaves other braces intact.
 - 2026-03-31: Added target-directory isolation guards so runs reject directories inside the Shmocky repo or nested inside another git repository unless explicitly overridden.
 - 2026-03-31: Moved Oracle prompt-size policy to Oracle agent config with `prompt_char_limit` in `shmocky.toml`, while keeping the global env setting as a fallback for ad hoc Oracle queries.
+- 2026-03-31: Rebalanced the operator UI so workflow activity remains in the primary right-rail view, with the protocol stream moved behind a dedicated debug tab instead of always consuming vertical space.
