@@ -148,6 +148,7 @@ export interface RunHistoryEntry {
 	run_name: string | null;
 	workflow_id: string;
 	target_dir: string;
+	execution_dir: string | null;
 	status:
 		| "idle"
 		| "starting"
@@ -183,6 +184,10 @@ export interface WorkflowRunState {
 	run_name: string | null;
 	workflow_id: string;
 	target_dir: string;
+	execution_dir: string | null;
+	workspace_strategy: "git_worktree" | null;
+	worktree_branch: string | null;
+	worktree_base_commit: string | null;
 	goal: string;
 	status:
 		| "idle"

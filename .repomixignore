@@ -8,3 +8,5 @@ repomix.config.json
 .gitignore
 .npmrc
 .python-version
+/docs/hedgeknight.md
+/docs/ideas.md

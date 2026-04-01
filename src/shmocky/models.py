@@ -225,6 +225,7 @@ class RunHistoryEntry(BaseModel):
     run_name: str | None = None
     workflow_id: str
     target_dir: str
+    execution_dir: str | None = None
     status: WorkflowRunStatus
     phase: WorkflowPhase
     started_at: datetime
@@ -273,6 +274,10 @@ class WorkflowRunState(BaseModel):
     run_name: str | None = Field(default=None, max_length=200)
     workflow_id: str
     target_dir: str
+    execution_dir: str | None = None
+    workspace_strategy: Literal["git_worktree"] | None = None
+    worktree_branch: str | None = None
+    worktree_base_commit: str | None = None
     goal: str
     status: WorkflowRunStatus = "starting"
     phase: WorkflowPhase = "idle"

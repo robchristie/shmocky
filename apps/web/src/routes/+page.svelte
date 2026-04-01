@@ -1233,8 +1233,28 @@ onMount(() => {
 				<div class="text-[0.92rem] font-medium">Session</div>
 				<div class="mt-3 grid gap-2 text-[0.78rem]">
 					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+						<div class="text-muted-foreground">Source repo</div>
+						<div class="truncate">{activeRun()?.target_dir ?? "—"}</div>
+					</div>
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+						<div class="text-muted-foreground">Workspace</div>
+						<div class="truncate">{activeRun()?.execution_dir ?? viewedState()?.workspace_root ?? "—"}</div>
+					</div>
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+						<div class="text-muted-foreground">Strategy</div>
+						<div class="truncate">{activeRun()?.workspace_strategy ?? "—"}</div>
+					</div>
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+						<div class="text-muted-foreground">Branch</div>
+						<div class="truncate">{activeRun()?.worktree_branch ?? "—"}</div>
+					</div>
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">Codex model</div>
 						<div class="truncate">{viewedState()?.thread?.model ?? "—"}</div>
+					</div>
+					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+						<div class="text-muted-foreground">Base commit</div>
+						<div class="truncate">{activeRun()?.worktree_base_commit ?? "—"}</div>
 					</div>
 					<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 						<div class="text-muted-foreground">Sandbox</div>
@@ -1503,11 +1523,11 @@ onMount(() => {
 								</select>
 							</div>
 							<div class="grid gap-2">
-								<label class="text-[0.72rem] text-muted-foreground" for="target-dir">Target directory</label>
+								<label class="text-[0.72rem] text-muted-foreground" for="target-dir">Source repo root</label>
 								<input
 									id="target-dir"
 									bind:value={targetDir}
-									placeholder="/absolute/path/to/repository-or-standalone-workdir"
+									placeholder="/absolute/path/to/git-repository-root"
 									class="h-10 rounded-md border border-border bg-background px-3 text-[0.84rem] outline-none"
 									disabled={workflowActive()}
 								/>
@@ -1568,7 +1588,9 @@ onMount(() => {
 										</div>
 									</div>
 									<div class="border-t border-border pt-2 text-[0.72rem]">
-										Use a repository root or a standalone directory outside the Shmocky repo. Nested paths inside another repo are rejected for isolation.
+										Shmocky creates a managed git worktree under its own `.shmocky/worktrees/`
+										area, then runs Codex there. The source repo root must be an external git
+										repository root, not a nested subdirectory.
 									</div>
 								</div>
 							{/if}

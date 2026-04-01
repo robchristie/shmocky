@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+import json
 import subprocess
 from pathlib import Path
 from typing import Any, cast
@@ -25,6 +26,19 @@ from shmocky.models import (
 )
 from shmocky.settings import AppSettings
 from shmocky.supervisor import LoadedRunContext, RunResources, WorkflowSupervisor, WorkflowSupervisorError
+
+
+def _init_git_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Shmocky Test"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "shmocky@example.com"],
+        check=True,
+    )
+    (path / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "init"], check=True)
 
 
 def test_supervisor_extract_json_from_fenced_answer() -> None:
@@ -132,6 +146,41 @@ judge_agent = "judge"
         supervisor._validate_target_dir(target_dir)
 
 
+def test_supervisor_rejects_non_git_target_dir(tmp_path: Path) -> None:
+    config_path = tmp_path / "config-home" / "shmocky.toml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        """
+[agents.engineer]
+provider = "codex"
+role = "engineer"
+
+[agents.judge]
+provider = "codex"
+role = "judge"
+
+[workflows.plan_execute_judge]
+planner_agent = "engineer"
+executor_agent = "engineer"
+judge_agent = "judge"
+""".strip(),
+        encoding="utf-8",
+    )
+    target_dir = tmp_path / "external-dir"
+    target_dir.mkdir()
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=config_path.parent,
+            workflow_config_path=config_path,
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+
+    with pytest.raises(WorkflowSupervisorError, match="git repository root"):
+        supervisor._validate_target_dir(target_dir)
+
+
 def test_supervisor_rejects_target_nested_in_other_repo(tmp_path: Path) -> None:
     config_path = tmp_path / "config-home" / "shmocky.toml"
     config_path.parent.mkdir()
@@ -167,7 +216,7 @@ judge_agent = "judge"
 
     with pytest.raises(
         WorkflowSupervisorError,
-        match="nested inside another git repository",
+        match="must be the git repository root itself",
     ):
         supervisor._validate_target_dir(target_dir)
 
@@ -717,6 +766,83 @@ def test_supervisor_resume_run_restarts_paused_oracle_run_from_manifest(tmp_path
     }
 
 
+def test_supervisor_start_run_uses_managed_worktree(tmp_path: Path) -> None:
+    config_path = tmp_path / "shmocky.toml"
+    config_path.write_text(
+        """
+[agents.engineer]
+provider = "codex"
+role = "engineer"
+
+[agents.judge]
+provider = "codex"
+role = "judge"
+
+[workflows.plan_execute_judge]
+planner_agent = "engineer"
+executor_agent = "engineer"
+judge_agent = "judge"
+""".strip(),
+        encoding="utf-8",
+    )
+    source_repo_root = tmp_path.parent / f"{tmp_path.name}-repo"
+    _init_git_repo(source_repo_root)
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            workflow_config_path=config_path,
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+    recorded: dict[str, str] = {}
+
+    async def successful_start_bridge(target_dir: Path, codex_agent: object, **_: object) -> None:
+        recorded["execution_dir"] = str(target_dir)
+
+    async def fake_execute_run(*args: object, **kwargs: object) -> None:
+        await supervisor._finish_run(
+            status="stopped",
+            phase="stopped",
+            note="test cleanup",
+        )
+
+    async def exercise() -> DashboardSnapshot:
+        cast(Any, supervisor)._start_bridge = successful_start_bridge
+        cast(Any, supervisor)._execute_run = fake_execute_run
+        snapshot = await supervisor.start_run(
+            WorkflowRunRequest(
+                workflow_id="plan_execute_judge",
+                target_dir=str(source_repo_root),
+                prompt="test managed worktree",
+            )
+        )
+        await asyncio.sleep(0)
+        return snapshot
+
+    snapshot = asyncio.run(exercise())
+
+    assert snapshot.state.workflow_run is not None
+    run = snapshot.state.workflow_run
+    assert run.target_dir == str(source_repo_root)
+    assert run.execution_dir is not None
+    assert run.execution_dir == recorded["execution_dir"]
+    assert run.execution_dir.startswith(str(tmp_path / ".shmocky" / "worktrees"))
+    assert run.workspace_strategy == "git_worktree"
+    assert run.worktree_branch == f"shmocky/{run.id}"
+    assert run.worktree_base_commit
+    assert Path(run.execution_dir).exists()
+
+    manifest_payload = json.loads(
+        (tmp_path / ".shmocky" / "runs" / run.id / WorkflowSupervisor.RUN_MANIFEST_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest_payload["workspace"]["sourceRepoRoot"] == str(source_repo_root)
+    assert manifest_payload["workspace"]["executionDir"] == run.execution_dir
+    assert manifest_payload["workspace"]["workspaceStrategy"] == "git_worktree"
+
+
 def test_supervisor_rolls_back_failed_run_start(tmp_path: Path) -> None:
     config_path = tmp_path / "shmocky.toml"
     config_path.write_text(
@@ -736,8 +862,8 @@ judge_agent = "judge"
 """.strip(),
         encoding="utf-8",
     )
-    target_dir = tmp_path.parent / f"{tmp_path.name}-target"
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = tmp_path.parent / f"{tmp_path.name}-target-repo"
+    _init_git_repo(target_dir)
     supervisor = WorkflowSupervisor(
         AppSettings(
             workspace_root=tmp_path,
@@ -776,6 +902,7 @@ judge_agent = "judge"
         assert supervisor._resources is None
         assert supervisor._archived_snapshot is None
         assert list(supervisor._recent_workflow_events) == []
+        assert not any((tmp_path / ".shmocky" / "worktrees").glob("*"))
 
         cast(Any, supervisor)._start_bridge = successful_start_bridge
         cast(Any, supervisor)._execute_run = fake_execute_run
@@ -794,5 +921,6 @@ judge_agent = "judge"
 
     assert snapshot.state.workflow_run is not None
     assert snapshot.state.workflow_run.workflow_id == "plan_execute_judge"
+    assert snapshot.state.workflow_run.execution_dir is not None
     assert supervisor._run_state is not None
     assert supervisor._run_state.status == "stopped"

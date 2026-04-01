@@ -66,7 +66,7 @@ The helper scripts in `scripts/` default to:
 - Vite allowed hosts set from `SHMOCKY_ALLOWED_HOSTS` or, by default in `scripts/run-frontend.sh`, `*` for remote dev access
 
 Then open the Vite URL in a browser. The header should show backend and Codex connectivity,
-and the main workspace should let you select a workflow, point it at a local target directory,
+and the main workspace should let you select a workflow, point it at a local git repository root,
 launch a run, inspect Codex transcript plus workflow activity, pause, resume, stop, or steer,
 respond to pending Codex approval or user-input requests from the workflow run tab, and durably
 resume an Oracle-blocked paused run after a backend restart.
@@ -85,7 +85,9 @@ The current workflow shape is intentionally narrow:
 - one active run at a time
 - one Codex planner or executor thread per run
 - one optional expert advisory hop plus a Codex judge that decides whether to continue
-- target directories must be repository roots or standalone directories outside the Shmocky repo by default
+- workflow `target_dir` means the source git repository root
+- Shmocky creates a managed worktree under `.shmocky/worktrees/<run-id>` and runs Codex there
+- source repos must be external git repository roots, not nested subdirectories inside another repo
 
 Oracle agent definitions can also carry role-specific sidecar settings such as `remote_host`,
 `chatgpt_url`, `timeout_seconds`, `model_strategy`, and `prompt_char_limit`, so different judge or

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import re
+import shutil
 import subprocess
 from collections import deque
 from dataclasses import dataclass
@@ -73,6 +74,15 @@ class LoadedRunContext:
     codex_agent: AgentDefinition
     expert_agent: AgentDefinition | None
     judge_agent: AgentDefinition
+
+
+@dataclass(slots=True)
+class PreparedExecutionWorkspace:
+    source_repo_root: Path
+    execution_dir: Path
+    workspace_strategy: Literal["git_worktree"]
+    worktree_branch: str
+    worktree_base_commit: str
 
 
 class WorkflowSupervisor:
@@ -292,6 +302,7 @@ class WorkflowSupervisor:
                     run_name=workflow_run.run_name,
                     workflow_id=workflow_run.workflow_id,
                     target_dir=workflow_run.target_dir,
+                    execution_dir=workflow_run.execution_dir,
                     status=workflow_run.status,
                     phase=workflow_run.phase,
                     started_at=workflow_run.started_at,
@@ -410,7 +421,7 @@ class WorkflowSupervisor:
             if workflow is None:
                 raise WorkflowNotFoundError(f"Unknown workflow '{payload.workflow_id}'.")
 
-            target_dir = self._validate_target_dir(Path(payload.target_dir))
+            source_repo_root = self._validate_target_dir(Path(payload.target_dir))
 
             agent_by_id = {agent.id: agent for agent in catalog.agents}
             codex_agent = agent_by_id[workflow.executor_agent]
@@ -422,6 +433,7 @@ class WorkflowSupervisor:
             judge_agent = agent_by_id[workflow.judge_agent]
 
             run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+            workspace = self._prepare_execution_workspace(source_repo_root, run_id)
             run_dir = self._settings.run_log_dir / run_id
             run_dir.mkdir(parents=True, exist_ok=True)
             resources = RunResources(
@@ -436,7 +448,11 @@ class WorkflowSupervisor:
                 id=run_id,
                 run_name=payload.run_name.strip() if payload.run_name else None,
                 workflow_id=workflow.id,
-                target_dir=str(target_dir),
+                target_dir=str(workspace.source_repo_root),
+                execution_dir=str(workspace.execution_dir),
+                workspace_strategy=workspace.workspace_strategy,
+                worktree_branch=workspace.worktree_branch,
+                worktree_base_commit=workspace.worktree_base_commit,
                 goal=payload.prompt,
                 status="starting",
                 phase="idle",
@@ -464,6 +480,13 @@ class WorkflowSupervisor:
                         ),
                         "judge": judge_agent.model_dump(mode="json"),
                     },
+                    "workspace": {
+                        "sourceRepoRoot": str(workspace.source_repo_root),
+                        "executionDir": str(workspace.execution_dir),
+                        "workspaceStrategy": workspace.workspace_strategy,
+                        "worktreeBranch": workspace.worktree_branch,
+                        "worktreeBaseCommit": workspace.worktree_base_commit,
+                    },
                 },
             )
             self._stage_run_snapshot()
@@ -472,18 +495,24 @@ class WorkflowSupervisor:
                 await self._record_workflow_event(
                     "run_started",
                     (
-                        f"Started run '{self._run_state.run_name}' using workflow '{workflow.id}' for {target_dir}"
+                        "Started run "
+                        f"'{self._run_state.run_name}' using workflow '{workflow.id}' "
+                        f"for {workspace.source_repo_root}"
                         if self._run_state.run_name
-                        else f"Started workflow '{workflow.id}' for {target_dir}"
+                        else f"Started workflow '{workflow.id}' for {workspace.source_repo_root}"
                     ),
                     payload={
                         "runId": run_id,
                         "runName": self._run_state.run_name,
                         "workflowId": workflow.id,
-                        "targetDir": str(target_dir),
+                        "targetDir": str(workspace.source_repo_root),
+                        "executionDir": str(workspace.execution_dir),
+                        "workspaceStrategy": workspace.workspace_strategy,
+                        "worktreeBranch": workspace.worktree_branch,
+                        "worktreeBaseCommit": workspace.worktree_base_commit,
                     },
                 )
-                await self._start_bridge(target_dir, codex_agent)
+                await self._start_bridge(workspace.execution_dir, codex_agent)
             except Exception:
                 await self._rollback_failed_run_start()
                 raise
@@ -500,6 +529,7 @@ class WorkflowSupervisor:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._run_task
             self._run_task = None
+        self._cleanup_managed_workspace()
         await self._cancel_snapshot_flush_task()
         self._run_state = None
         self._resources = None
@@ -518,26 +548,59 @@ class WorkflowSupervisor:
             raise WorkflowSupervisorError(
                 f"Target directory does not exist or is not a directory: {resolved}"
             )
-        if not self._settings.allow_nested_target_dirs and resolved.is_relative_to(
-            self._settings.workspace_root
-        ):
+        if resolved.is_relative_to(self._settings.workspace_root):
             raise WorkflowSupervisorError(
                 "Target directory is inside the Shmocky workspace. "
-                "Use a repository root or an external directory for isolation."
+                "Use an external git repository root for isolation."
             )
 
         containing_git_root = self._git_root_for(resolved)
-        if (
-            not self._settings.allow_nested_target_dirs
-            and containing_git_root is not None
-            and containing_git_root != resolved
-        ):
+        if containing_git_root is None:
             raise WorkflowSupervisorError(
-                "Target directory is nested inside another git repository: "
-                f"{containing_git_root}. Use the repository root itself so parent repo "
-                "instructions and history do not leak into the run."
+                "Target directory is not a git repository root. "
+                "Managed workflow runs require a git repository root."
+            )
+        if containing_git_root != resolved:
+            raise WorkflowSupervisorError(
+                "Target directory must be the git repository root itself: "
+                f"{containing_git_root}. Nested paths are not supported for managed worktree runs."
             )
         return resolved
+
+    def _prepare_execution_workspace(
+        self,
+        source_repo_root: Path,
+        run_id: str,
+    ) -> PreparedExecutionWorkspace:
+        worktree_root = self._managed_worktree_root()
+        execution_dir = worktree_root / run_id
+        branch_name = f"shmocky/{run_id}"
+        base_commit = self._git_head_commit_for(source_repo_root)
+        if execution_dir.exists():
+            raise WorkflowSupervisorError(
+                f"Managed worktree path already exists: {execution_dir}"
+            )
+        worktree_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self._run_git(
+                source_repo_root,
+                "worktree",
+                "add",
+                "-b",
+                branch_name,
+                str(execution_dir),
+                base_commit,
+            )
+        except Exception:
+            self._cleanup_prepared_worktree(source_repo_root, execution_dir, branch_name)
+            raise
+        return PreparedExecutionWorkspace(
+            source_repo_root=source_repo_root,
+            execution_dir=execution_dir,
+            workspace_strategy="git_worktree",
+            worktree_branch=branch_name,
+            worktree_base_commit=base_commit,
+        )
 
     async def pause_run(self) -> DashboardSnapshot:
         async with self._lock:
@@ -572,7 +635,7 @@ class WorkflowSupervisor:
                         else []
                     )
                     await self._start_bridge(
-                        Path(self._run_state.target_dir),
+                        self._execution_dir_for_run(),
                         context.codex_agent,
                         resume_thread_id=checkpoint.thread_id,
                         transcript_seed=transcript_seed,
@@ -1302,6 +1365,7 @@ class WorkflowSupervisor:
             "goal": self._run_state.goal,
             "workflowId": self._run_state.workflow_id,
             "targetDir": self._run_state.target_dir,
+            "executionDir": self._run_state.execution_dir,
             "loop": self._run_state.current_loop,
             "judgeCalls": self._run_state.judge_calls,
             "recentSteeringNotes": self._run_state.recent_steering_notes[-5:],
@@ -1338,7 +1402,7 @@ class WorkflowSupervisor:
             raise WorkflowSupervisorError("No workflow resources are available.")
         bridge = CodexAppServerBridge(
             self._settings,
-            workspace_root=Path(self._run_state.target_dir),
+            workspace_root=self._execution_dir_for_run(),
             event_log_dir=self._resources.run_dir / event_log_subdir,
             agent_config=CodexAgentConfig(
                 role=agent.role,
@@ -1377,7 +1441,7 @@ class WorkflowSupervisor:
         process = await asyncio.create_subprocess_exec(
             "git",
             "-C",
-            self._run_state.target_dir,
+            str(self._execution_dir_for_run()),
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1432,6 +1496,80 @@ class WorkflowSupervisor:
             return None
         root = completed.stdout.strip()
         return Path(root).resolve() if root else None
+
+    @staticmethod
+    def _git_head_commit_for(path: Path) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise WorkflowSupervisorError(
+                f"Could not inspect git HEAD for {path}: {exc}"
+            ) from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "git rev-parse HEAD failed"
+            raise WorkflowSupervisorError(
+                f"Could not determine the base commit for managed worktree creation: {detail}"
+            )
+        return completed.stdout.strip()
+
+    @staticmethod
+    def _run_git(repo_root: Path, *args: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise WorkflowSupervisorError(f"Could not run git in {repo_root}: {exc}") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "git command failed"
+            raise WorkflowSupervisorError(detail)
+        return completed.stdout.strip()
+
+    def _managed_worktree_root(self) -> Path:
+        return self._settings.workspace_root / ".shmocky" / "worktrees"
+
+    def _execution_dir_for_run(self) -> Path:
+        if self._run_state is None:
+            raise WorkflowSupervisorError("No workflow run exists.")
+        execution_dir = self._run_state.execution_dir or self._run_state.target_dir
+        return Path(execution_dir)
+
+    def _cleanup_managed_workspace(self) -> None:
+        if self._run_state is None or self._run_state.workspace_strategy != "git_worktree":
+            return
+        execution_dir_value = self._run_state.execution_dir
+        branch_name = self._run_state.worktree_branch
+        if not execution_dir_value or not branch_name:
+            return
+        self._cleanup_prepared_worktree(
+            Path(self._run_state.target_dir),
+            Path(execution_dir_value),
+            branch_name,
+        )
+
+    def _cleanup_prepared_worktree(
+        self,
+        source_repo_root: Path,
+        execution_dir: Path,
+        branch_name: str,
+    ) -> None:
+        if execution_dir.exists():
+            try:
+                self._run_git(source_repo_root, "worktree", "remove", "--force", str(execution_dir))
+            except WorkflowSupervisorError:
+                shutil.rmtree(execution_dir, ignore_errors=True)
+        try:
+            self._run_git(source_repo_root, "branch", "-D", branch_name)
+        except WorkflowSupervisorError:
+            pass
 
     @staticmethod
     def _extract_json(text: str) -> str:

@@ -37,7 +37,6 @@ You are the workflow judge. Decide whether the run should continue, complete, or
 
 [workflows.plan_execute_judge]
 kind = "linear_loop"
-planner_agent = "engineer"
 executor_agent = "engineer"
 expert_agent = "expert"
 judge_agent = "judge"
