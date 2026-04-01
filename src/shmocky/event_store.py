@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+import json
 from uuid import uuid4
 
 from .models import (
@@ -20,7 +21,7 @@ class RawEventStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = asyncio.Lock()
-        self._sequence = 0
+        self._sequence = _load_last_sequence(path)
 
     async def append(
         self,
@@ -56,7 +57,7 @@ class WorkflowEventStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = asyncio.Lock()
-        self._sequence = 0
+        self._sequence = _load_last_sequence(path)
 
     async def append(
         self,
@@ -80,3 +81,21 @@ class WorkflowEventStore:
                 handle.write(record.model_dump_json())
                 handle.write("\n")
             return record
+
+
+def _load_last_sequence(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        last_line = ""
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    last_line = line
+        if not last_line:
+            return 0
+        payload = json.loads(last_line)
+        sequence = payload.get("sequence")
+        return sequence if isinstance(sequence, int) and sequence >= 0 else 0
+    except Exception:
+        return 0

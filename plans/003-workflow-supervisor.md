@@ -89,3 +89,5 @@ Frontend:
 - 2026-03-31: Split advisory and control roles so Oracle can act as a free-text expert while a Codex judge owns workflow decisions, making cross-agent handoff observable without relying on Oracle for structured control output.
 - 2026-04-01: Added per-Oracle-agent `chatgpt_url` support so advisory runs can be directed into dedicated ChatGPT project folders instead of cluttering the main browser history.
 - 2026-04-01: Oracle-side failures now pause workflow runs in a resumable state instead of failing outright, and the default Oracle wait budget was raised to one hour for slower browser-model calls.
+- 2026-04-01: Added live browser handling for pending app-server requests, including approval and request-user-input responses, and fixed pending-request clearing to follow the protocol's `requestId` field.
+- 2026-04-01: Added durable resume semantics for Oracle-blocked pauses by persisting a restart-safe checkpoint, restoring the paused run at startup, and resuming the saved Codex thread before retrying the blocked Oracle step.

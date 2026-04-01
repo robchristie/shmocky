@@ -26,7 +26,6 @@ Implemented:
 
 Not implemented yet:
 
-- approvals and tool/user-input request handling in the browser
 - general graph execution, multi-run scheduling, repo cloning, or browser-side workflow editing
 - multi-thread management, resume, fork, archive, or notebook projections
 - auth, budgets, policy gates, or multi-user tenancy
@@ -68,7 +67,9 @@ The helper scripts in `scripts/` default to:
 
 Then open the Vite URL in a browser. The header should show backend and Codex connectivity,
 and the main workspace should let you select a workflow, point it at a local target directory,
-launch a run, inspect Codex transcript plus workflow activity, and pause, resume, stop, or steer.
+launch a run, inspect Codex transcript plus workflow activity, pause, resume, stop, or steer,
+respond to pending Codex approval or user-input requests from the workflow run tab, and durably
+resume an Oracle-blocked paused run after a backend restart.
 
 ## Workflow Config
 
@@ -107,6 +108,7 @@ The backend exposes:
 - `POST /api/runs/active/resume`
 - `POST /api/runs/active/stop`
 - `POST /api/runs/active/steer`
+- `POST /api/server-requests/{request_id}/resolve`
 
 The browser is the primary way to use these, but the endpoints are available for smoke tests and automation. Each run now stores a durable `dashboard-snapshot.json` under `.shmocky/runs/<run-id>/`, which the UI can reopen to restore transcript, workflow activity, and recent protocol context after the live Codex session has ended.
 

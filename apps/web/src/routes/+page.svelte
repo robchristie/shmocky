@@ -35,6 +35,26 @@ type DerivedTranscriptEntry = {
 type EventStreamMode = "coalesced" | "important" | "raw";
 type OperatorRailTab = "run" | "activity" | "protocol";
 
+type PendingQuestionOption = {
+	label: string;
+	description: string;
+};
+
+type PendingUserInputQuestion = {
+	header: string;
+	id: string;
+	question: string;
+	options?: PendingQuestionOption[] | null;
+	isOther?: boolean;
+	isSecret?: boolean;
+};
+
+type PendingRequestAction = {
+	label: string;
+	result: unknown;
+	variant: "default" | "secondary" | "outline" | "destructive";
+};
+
 let dashboardState: DashboardState | null = $state(null);
 let workflowCatalog: WorkflowCatalogResponse | null = $state(null);
 let recentEvents: RawEventRecord[] = $state([]);
@@ -55,6 +75,10 @@ let pausingRun = $state(false);
 let resumingRun = $state(false);
 let stoppingRun = $state(false);
 let steeringRun = $state(false);
+let resolvingServerRequest = $state(false);
+let customServerRequestResponse = $state("");
+let userInputDrafts = $state<Record<string, string>>({});
+let pendingRequestSeedKey = $state("");
 let transcriptPane: HTMLDivElement | null = $state(null);
 let workflowPane: HTMLDivElement | null = $state(null);
 let eventPane: HTMLDivElement | null = $state(null);
@@ -85,6 +109,10 @@ function activeRun() {
 
 function liveRun() {
 	return dashboardState?.workflow_run ?? null;
+}
+
+function livePendingRequest() {
+	return dashboardState?.pending_server_request ?? null;
 }
 
 function viewedState(): DashboardState | null {
@@ -277,6 +305,73 @@ async function queueSteer() {
 	} finally {
 		steeringRun = false;
 	}
+}
+
+async function resolvePendingServerRequest(result: unknown) {
+	const pending = livePendingRequest();
+	if (!pending) {
+		return;
+	}
+	resolvingServerRequest = true;
+	try {
+		const snapshot = await request<DashboardSnapshot>(
+			`/api/server-requests/${encodeURIComponent(pending.request_id)}/resolve`,
+			{
+				method: "POST",
+				body: JSON.stringify({ result }),
+			},
+		);
+		applySnapshot(snapshot);
+	} catch (error) {
+		requestError = toErrorMessage(error);
+	} finally {
+		resolvingServerRequest = false;
+	}
+}
+
+async function submitCustomServerRequestResponse() {
+	let result: unknown = null;
+	if (customServerRequestResponse.trim()) {
+		try {
+			result = JSON.parse(customServerRequestResponse);
+		} catch (error) {
+			requestError = `Invalid response JSON: ${toErrorMessage(error)}`;
+			return;
+		}
+	}
+	await resolvePendingServerRequest(result);
+}
+
+function setUserInputDraft(questionId: string, value: string) {
+	userInputDrafts = {
+		...userInputDrafts,
+		[questionId]: value,
+	};
+}
+
+function parseDelimitedAnswers(value: string): string[] {
+	return value
+		.split(/\n|,/)
+		.map((entry) => entry.trim())
+		.filter(Boolean);
+}
+
+async function submitPendingUserInput() {
+	const pending = livePendingRequest();
+	const questions = pendingRequestQuestions(pending);
+	if (!pending || !questions.length) {
+		return;
+	}
+	const answers: Record<string, { answers: string[] }> = {};
+	for (const question of questions) {
+		const parsed = parseDelimitedAnswers(userInputDrafts[question.id] ?? "");
+		if (!parsed.length) {
+			requestError = `Answer required for ${question.header}.`;
+			return;
+		}
+		answers[question.id] = { answers: parsed };
+	}
+	await resolvePendingServerRequest({ answers });
 }
 
 function connectStream() {
@@ -559,6 +654,248 @@ function workflowPaused() {
 	return liveRun()?.status === "paused";
 }
 
+function pendingRequestParams(
+	request = livePendingRequest(),
+): Record<string, unknown> | null {
+	const params = request?.params;
+	if (!params || typeof params !== "object") {
+		return null;
+	}
+	return params;
+}
+
+function pendingRequestMethodLabel(method: string | null | undefined) {
+	switch (method) {
+		case "item/commandExecution/requestApproval":
+			return "Command approval";
+		case "item/fileChange/requestApproval":
+			return "File-change approval";
+		case "item/permissions/requestApproval":
+			return "Permission grant";
+		case "item/tool/requestUserInput":
+			return "User input requested";
+		case "mcpServer/elicitation/request":
+			return "MCP elicitation";
+		case "execCommandApproval":
+			return "Legacy command approval";
+		case "applyPatchApproval":
+			return "Legacy patch approval";
+		default:
+			return method ?? "Pending request";
+	}
+}
+
+function pendingRequestReason(request = livePendingRequest()) {
+	const reason = pendingRequestParams(request)?.reason;
+	return typeof reason === "string" ? reason : null;
+}
+
+function pendingRequestCommand(request = livePendingRequest()) {
+	const command = pendingRequestParams(request)?.command;
+	if (typeof command === "string") {
+		return command;
+	}
+	if (Array.isArray(command)) {
+		return command
+			.filter((entry): entry is string => typeof entry === "string")
+			.join(" ");
+	}
+	return null;
+}
+
+function pendingRequestCwd(request = livePendingRequest()) {
+	const cwd = pendingRequestParams(request)?.cwd;
+	return typeof cwd === "string" ? cwd : null;
+}
+
+function pendingRequestGrantRoot(request = livePendingRequest()) {
+	const grantRoot = pendingRequestParams(request)?.grantRoot;
+	return typeof grantRoot === "string" ? grantRoot : null;
+}
+
+function pendingRequestPermissions(request = livePendingRequest()) {
+	return pendingRequestParams(request)?.permissions ?? null;
+}
+
+function pendingRequestUrl(request = livePendingRequest()) {
+	const url = pendingRequestParams(request)?.url;
+	return typeof url === "string" ? url : null;
+}
+
+function pendingRequestQuestions(
+	request = livePendingRequest(),
+): PendingUserInputQuestion[] {
+	const questions = pendingRequestParams(request)?.questions;
+	if (!Array.isArray(questions)) {
+		return [];
+	}
+	const normalized: PendingUserInputQuestion[] = [];
+	for (const entry of questions) {
+		if (!entry || typeof entry !== "object") {
+			continue;
+		}
+		const question = entry as Record<string, unknown>;
+		if (
+			typeof question.id !== "string" ||
+			typeof question.header !== "string" ||
+			typeof question.question !== "string"
+		) {
+			continue;
+		}
+		const options = Array.isArray(question.options)
+			? question.options
+					.filter(
+						(option): option is Record<string, unknown> =>
+							Boolean(option) && typeof option === "object",
+					)
+					.map((option) => ({
+						label: typeof option.label === "string" ? option.label : "",
+						description:
+							typeof option.description === "string" ? option.description : "",
+					}))
+					.filter((option) => option.label)
+			: null;
+		normalized.push({
+			header: question.header,
+			id: question.id,
+			question: question.question,
+			options,
+			isOther: question.isOther === true,
+			isSecret: question.isSecret === true,
+		});
+	}
+	return normalized;
+}
+
+function stringifyJson(value: unknown) {
+	return JSON.stringify(value ?? null, null, 2) ?? "null";
+}
+
+function commandApprovalAction(decision: string): PendingRequestAction | null {
+	switch (decision) {
+		case "accept":
+			return { label: "Approve", result: { decision }, variant: "default" };
+		case "acceptForSession":
+			return {
+				label: "Approve for session",
+				result: { decision },
+				variant: "secondary",
+			};
+		case "decline":
+			return { label: "Decline", result: { decision }, variant: "outline" };
+		case "cancel":
+			return {
+				label: "Cancel turn",
+				result: { decision },
+				variant: "destructive",
+			};
+		default:
+			return null;
+	}
+}
+
+function reviewApprovalAction(decision: string): PendingRequestAction | null {
+	switch (decision) {
+		case "approved":
+			return { label: "Approve", result: { decision }, variant: "default" };
+		case "approved_for_session":
+			return {
+				label: "Approve for session",
+				result: { decision },
+				variant: "secondary",
+			};
+		case "denied":
+			return { label: "Deny", result: { decision }, variant: "outline" };
+		case "abort":
+			return { label: "Abort", result: { decision }, variant: "destructive" };
+		default:
+			return null;
+	}
+}
+
+function pendingRequestActions(
+	request = livePendingRequest(),
+): PendingRequestAction[] {
+	if (!request) {
+		return [];
+	}
+	const params = pendingRequestParams(request);
+	if (request.method === "item/commandExecution/requestApproval") {
+		const available = Array.isArray(params?.availableDecisions)
+			? params.availableDecisions.filter(
+					(decision): decision is string => typeof decision === "string",
+				)
+			: [];
+		const decisions = available.length
+			? available
+			: ["accept", "acceptForSession", "decline", "cancel"];
+		return decisions
+			.map((decision) => commandApprovalAction(decision))
+			.filter((action): action is PendingRequestAction => action !== null);
+	}
+	if (request.method === "item/fileChange/requestApproval") {
+		return ["accept", "acceptForSession", "decline", "cancel"]
+			.map((decision) => commandApprovalAction(decision))
+			.filter((action): action is PendingRequestAction => action !== null);
+	}
+	if (
+		request.method === "execCommandApproval" ||
+		request.method === "applyPatchApproval"
+	) {
+		return ["approved", "approved_for_session", "denied", "abort"]
+			.map((decision) => reviewApprovalAction(decision))
+			.filter((action): action is PendingRequestAction => action !== null);
+	}
+	if (request.method === "item/permissions/requestApproval") {
+		const permissions = pendingRequestPermissions(request) ?? {};
+		return [
+			{
+				label: "Grant for turn",
+				result: { permissions, scope: "turn" },
+				variant: "default",
+			},
+			{
+				label: "Grant for session",
+				result: { permissions, scope: "session" },
+				variant: "secondary",
+			},
+		];
+	}
+	if (request.method === "mcpServer/elicitation/request") {
+		const actions: PendingRequestAction[] = [
+			{
+				label: "Decline",
+				result: { action: "decline", content: null, _meta: null },
+				variant: "outline",
+			},
+			{
+				label: "Cancel",
+				result: { action: "cancel", content: null, _meta: null },
+				variant: "destructive",
+			},
+		];
+		if (pendingRequestUrl(request)) {
+			actions.unshift({
+				label: "Accept URL",
+				result: { action: "accept", content: null, _meta: null },
+				variant: "default",
+			});
+		}
+		return actions;
+	}
+	return [];
+}
+
+function defaultPendingRequestResponse(request = livePendingRequest()) {
+	if (!request) {
+		return null;
+	}
+	if (request.method === "item/tool/requestUserInput") {
+		return { answers: {} };
+	}
+	return pendingRequestActions(request)[0]?.result ?? null;
+}
+
 function stoppedOnLoopBudget() {
 	const run = activeRun();
 	return (
@@ -651,6 +988,26 @@ $effect(() => {
 			eventPane.scrollTop = eventPane.scrollHeight;
 		}
 	});
+});
+
+$effect(() => {
+	const pending = livePendingRequest();
+	const seedKey = pending ? `${pending.request_id}:${pending.method}` : "";
+	if (seedKey === pendingRequestSeedKey) {
+		return;
+	}
+	pendingRequestSeedKey = seedKey;
+	if (!pending) {
+		customServerRequestResponse = "";
+		userInputDrafts = {};
+		return;
+	}
+	customServerRequestResponse = stringifyJson(
+		defaultPendingRequestResponse(pending),
+	);
+	userInputDrafts = Object.fromEntries(
+		pendingRequestQuestions(pending).map((question) => [question.id, ""]),
+	);
 });
 
 onMount(() => {
@@ -937,6 +1294,11 @@ onMount(() => {
 							}}
 						>
 							Workflow run
+						{#if livePendingRequest()}
+							<span class="ml-2 inline-flex rounded-full border border-[#d0be92]/30 px-2 py-0.5 text-[0.68rem] text-[#d0be92]">
+								action
+							</span>
+						{/if}
 						</button>
 						<button
 							type="button"
@@ -981,7 +1343,7 @@ onMount(() => {
 						</div>
 					{:else if operatorRailTab === "run"}
 						<div class="text-[0.73rem] text-muted-foreground">
-							Launch a workflow against a target repository or workdir.
+							Launch a workflow and respond to live Codex approval or input requests.
 						</div>
 					{:else}
 						<div class="text-[0.73rem] text-muted-foreground">
@@ -993,6 +1355,127 @@ onMount(() => {
 				{#if operatorRailTab === "run"}
 					<div class="min-h-0 overflow-y-auto px-5 py-4">
 						<div class="grid gap-3">
+							{#if livePendingRequest()}
+								<div class="grid gap-3 rounded-lg border border-[#6b5a4d] bg-[#171513] p-4">
+									<div class="flex flex-wrap items-center justify-between gap-3">
+										<div>
+											<div class="text-[0.72rem] uppercase tracking-[0.08em] text-[#d0be92]">
+												Operator action required
+											</div>
+											<div class="mt-1 text-[0.9rem] text-foreground">
+												{pendingRequestMethodLabel(livePendingRequest()?.method)}
+											</div>
+										</div>
+										<div class="text-[0.72rem] text-muted-foreground">
+											{trimMiddle(livePendingRequest()?.request_id, 16, 8)}
+										</div>
+									</div>
+									{#if pendingRequestReason(livePendingRequest())}
+										<div class="text-[0.78rem] leading-6 text-muted-foreground">
+											{pendingRequestReason(livePendingRequest())}
+										</div>
+									{/if}
+									{#if pendingRequestCommand(livePendingRequest())}
+										<div class="grid gap-1">
+											<div class="text-[0.72rem] text-muted-foreground">Command</div>
+											<pre class="overflow-x-auto rounded-md border border-border bg-background/70 p-3 text-[0.75rem] leading-6 text-foreground">{pendingRequestCommand(livePendingRequest())}</pre>
+										</div>
+									{/if}
+									{#if pendingRequestCwd(livePendingRequest())}
+										<div class="text-[0.74rem] text-muted-foreground">
+											cwd: {pendingRequestCwd(livePendingRequest())}
+										</div>
+									{/if}
+									{#if pendingRequestGrantRoot(livePendingRequest())}
+										<div class="text-[0.74rem] text-muted-foreground">
+											grant root: {pendingRequestGrantRoot(livePendingRequest())}
+										</div>
+									{/if}
+									{#if pendingRequestPermissions(livePendingRequest())}
+										<div class="grid gap-1">
+											<div class="text-[0.72rem] text-muted-foreground">Requested permissions</div>
+											<pre class="overflow-x-auto rounded-md border border-border bg-background/70 p-3 text-[0.75rem] leading-6 text-foreground">{stringifyJson(pendingRequestPermissions(livePendingRequest()))}</pre>
+										</div>
+									{/if}
+									{#if pendingRequestUrl(livePendingRequest())}
+										<div class="text-[0.74rem] text-muted-foreground">
+											URL: {pendingRequestUrl(livePendingRequest())}
+										</div>
+									{/if}
+									{#if pendingRequestQuestions(livePendingRequest()).length}
+										<div class="grid gap-3 border-t border-border pt-3">
+											{#each pendingRequestQuestions(livePendingRequest()) as question (question.id)}
+												<div class="grid gap-2 rounded-md border border-border p-3">
+													<div class="text-[0.72rem] text-muted-foreground">{question.header}</div>
+													<div class="text-[0.82rem] text-foreground">{question.question}</div>
+													{#if question.options?.length}
+														<div class="flex flex-wrap gap-2">
+															{#each question.options as option}
+																<button
+																	type="button"
+																	class={`rounded-md border px-2 py-1 text-[0.72rem] transition-colors ${(userInputDrafts[question.id] ?? "") === option.label ? "border-[#d0be92] bg-[#2a241d] text-[#f0e4c6]" : "border-border text-muted-foreground hover:text-foreground"}`}
+																	onclick={() => {
+																		setUserInputDraft(question.id, option.label);
+																	}}
+																>
+																	{option.label}
+																</button>
+															{/each}
+														</div>
+													{/if}
+													<input
+														type={question.isSecret ? "password" : "text"}
+														value={userInputDrafts[question.id] ?? ""}
+														placeholder={question.isOther || !question.options?.length ? "Enter one or more answers" : "Select an option or type a custom answer"}
+														class="h-10 rounded-md border border-border bg-background px-3 text-[0.82rem] outline-none"
+														oninput={(event) => {
+															setUserInputDraft(question.id, (event.currentTarget as HTMLInputElement).value);
+														}}
+													/>
+													{#if question.options?.length}
+														<div class="text-[0.7rem] text-muted-foreground">
+															Use commas or new lines for multiple answers.
+														</div>
+													{/if}
+												</div>
+											{/each}
+											<div class="flex justify-end">
+												<Button disabled={resolvingServerRequest} onclick={submitPendingUserInput}>
+													{resolvingServerRequest ? "Sending" : "Submit answers"}
+												</Button>
+											</div>
+										</div>
+									{/if}
+									{#if pendingRequestActions(livePendingRequest()).length}
+										<div class="flex flex-wrap gap-2 border-t border-border pt-3">
+											{#each pendingRequestActions(livePendingRequest()) as action}
+												<Button variant={action.variant} size="sm" disabled={resolvingServerRequest} onclick={() => { void resolvePendingServerRequest(action.result); }}>
+													{action.label}
+												</Button>
+											{/each}
+										</div>
+									{/if}
+									<details class="border-t border-border pt-3">
+										<summary class="cursor-pointer text-[0.74rem] text-muted-foreground">Custom response JSON</summary>
+										<div class="mt-3 grid gap-3">
+											<Textarea bind:value={customServerRequestResponse} rows={8} class="resize-y text-[0.78rem] leading-6" disabled={resolvingServerRequest} />
+											<div class="flex flex-wrap items-center justify-between gap-3">
+												<div class="text-[0.72rem] text-muted-foreground">Send an exact result payload when the quick actions are not enough.</div>
+												<Button variant="outline" disabled={resolvingServerRequest} onclick={submitCustomServerRequestResponse}>
+													{resolvingServerRequest ? "Sending" : "Send custom response"}
+												</Button>
+											</div>
+										</div>
+									</details>
+									<details class="border-t border-border pt-3">
+										<summary class="cursor-pointer text-[0.74rem] text-muted-foreground">Raw request payload</summary>
+										<pre class="mt-3 overflow-x-auto rounded-md border border-border bg-background/70 p-3 text-[0.74rem] leading-6 text-foreground">{stringifyJson(livePendingRequest()?.params)}</pre>
+									</details>
+									{#if requestError}
+										<div class="border-t border-border pt-3 text-[0.74rem] text-[#c97c6b]">{requestError}</div>
+									{/if}
+								</div>
+							{/if}
 							<div class="grid gap-2">
 								<label class="text-[0.72rem] text-muted-foreground" for="run-name">Run name</label>
 								<input

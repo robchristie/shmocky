@@ -4,17 +4,25 @@ import asyncio
 from datetime import UTC, datetime
 import subprocess
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
+from shmocky.bridge import CodexAppServerBridge
 from shmocky.models import (
     ConnectionState,
     DashboardSnapshot,
     DashboardState,
+    OracleResumeCheckpoint,
+    PendingServerRequest,
+    ServerRequestResolutionRequest,
+    ThreadState,
+    TranscriptItem,
+    WorkflowEventRecord,
     WorkflowRunState,
 )
 from shmocky.settings import AppSettings
-from shmocky.supervisor import WorkflowSupervisor, WorkflowSupervisorError
+from shmocky.supervisor import LoadedRunContext, WorkflowSupervisor, WorkflowSupervisorError
 
 
 def test_supervisor_extract_json_from_fenced_answer() -> None:
@@ -290,6 +298,57 @@ def test_supervisor_snapshot_uses_archived_completed_run_when_bridge_is_gone(
     ]
 
 
+def test_supervisor_resolves_pending_server_request(tmp_path: Path) -> None:
+    noted_at = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+
+    class DummyBridge:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+            self._snapshot = DashboardSnapshot(
+                state=DashboardState(
+                    workspace_root=str(tmp_path),
+                    event_log_path=str(tmp_path / ".shmocky" / "events"),
+                    connection=ConnectionState(backend_online=True, codex_connected=True),
+                    pending_server_request=PendingServerRequest(
+                        request_id="req-1",
+                        method="item/commandExecution/requestApproval",
+                        params={"command": "git status"},
+                        noted_at=noted_at,
+                    ),
+                ),
+                recent_events=[],
+                recent_workflow_events=[],
+            )
+
+        def snapshot(self) -> DashboardSnapshot:
+            return self._snapshot
+
+        async def resolve_server_request(self, request_id: str, *, result: object) -> DashboardSnapshot:
+            self.calls.append((request_id, result))
+            return self._snapshot
+
+    bridge = DummyBridge()
+    supervisor._bridge = cast(CodexAppServerBridge, bridge)
+
+    snapshot = asyncio.run(
+        supervisor.resolve_server_request(
+            "req-1",
+            ServerRequestResolutionRequest(result={"decision": "accept"}),
+        )
+    )
+
+    assert bridge.calls == [("req-1", {"decision": "accept"})]
+    assert snapshot.state.pending_server_request is not None
+    assert snapshot.state.pending_server_request.request_id == "req-1"
+
+
 def test_supervisor_pauses_and_resumes_after_oracle_failure(tmp_path: Path) -> None:
     started_at = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
     supervisor = WorkflowSupervisor(
@@ -318,12 +377,26 @@ def test_supervisor_pauses_and_resumes_after_oracle_failure(tmp_path: Path) -> N
     )
 
     async def exercise() -> None:
+        supervisor._archived_snapshot = DashboardSnapshot(
+            state=DashboardState(
+                workspace_root=str(tmp_path),
+                event_log_path=str(tmp_path / ".shmocky" / "events"),
+                connection=ConnectionState(backend_online=True, codex_connected=False),
+                thread=ThreadState(id="thread-1", status="idle"),
+                workflow_run=supervisor._run_state,
+            ),
+            recent_events=[],
+            recent_workflow_events=[],
+        )
         task = asyncio.create_task(
             supervisor._pause_for_oracle_failure(
                 agent_label="expert",
+                agent_id="expert",
+                prompt="Assess the current run.",
                 detail="Oracle query timed out after 3600s.",
             )
         )
+        supervisor._run_task = task
         await asyncio.sleep(0)
         assert supervisor._run_state is not None
         assert supervisor._run_state.status == "paused"
@@ -333,8 +406,252 @@ def test_supervisor_pauses_and_resumes_after_oracle_failure(tmp_path: Path) -> N
 
         await supervisor.resume_run()
         await task
+        supervisor._run_task = None
 
     asyncio.run(exercise())
 
     assert supervisor._run_state is not None
     assert supervisor._run_state.status == "running"
+
+
+def test_supervisor_restores_resumable_oracle_pause_from_disk(tmp_path: Path) -> None:
+    run_dir = tmp_path / ".shmocky" / "runs" / "20260401T120000Z-resume123"
+    run_dir.mkdir(parents=True)
+    started_at = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+    noted_at = datetime(2026, 4, 1, 12, 30, tzinfo=UTC)
+    snapshot = DashboardSnapshot(
+        state=DashboardState(
+            workspace_root=str(tmp_path / "repo"),
+            event_log_path=str(run_dir / "codex-events" / "events.jsonl"),
+            connection=ConnectionState(backend_online=True, codex_connected=True),
+            thread=ThreadState(id="thread-1", status="idle"),
+            transcript=[
+                TranscriptItem(
+                    item_id="assistant-1",
+                    role="assistant",
+                    text="Investigated the repo.",
+                    status="completed",
+                    turn_id="turn-1",
+                )
+            ],
+            workflow_run=WorkflowRunState(
+                id="20260401T120000Z-resume123",
+                run_name="oracle resume",
+                workflow_id="plan_execute_judge",
+                target_dir=str(tmp_path / "repo"),
+                goal="Keep the run resumable.",
+                status="paused",
+                phase="paused",
+                codex_agent_id="engineer",
+                expert_agent_id="expert",
+                judge_agent_id="judge",
+                started_at=started_at,
+                updated_at=noted_at,
+                current_loop=2,
+                max_loops=4,
+                judge_calls=1,
+                max_judge_calls=4,
+                max_runtime_minutes=45,
+                last_plan="Plan",
+                last_codex_output="Codex output",
+                oracle_resume_checkpoint=OracleResumeCheckpoint(
+                    agent_label="expert",
+                    agent_id="expert",
+                    thread_id="thread-1",
+                    loop_index=2,
+                    prompt="Assess the current run.",
+                    detail="Oracle timed out.",
+                    noted_at=noted_at,
+                ),
+                last_error="Oracle expert failed and the run is paused: Oracle timed out.",
+            ),
+        ),
+        recent_events=[],
+        recent_workflow_events=[],
+    )
+    (run_dir / WorkflowSupervisor.RUN_SNAPSHOT_FILENAME).write_text(
+        snapshot.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    (run_dir / "workflow-events.jsonl").write_text(
+        WorkflowEventRecord(
+            sequence=1,
+            event_id="event-1",
+            recorded_at=noted_at,
+            kind="oracle_blocked",
+            message="Oracle expert failed; run paused until operator resume.",
+            payload={"agent": "expert"},
+        ).model_dump_json()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            run_log_dir=tmp_path / ".shmocky" / "runs",
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+
+    restored = supervisor.snapshot()
+
+    assert restored.state.workflow_run is not None
+    assert restored.state.workflow_run.oracle_resume_checkpoint is not None
+    assert restored.state.workflow_run.oracle_resume_checkpoint.thread_id == "thread-1"
+    assert restored.state.thread is not None
+    assert restored.state.thread.id == "thread-1"
+    assert restored.state.transcript[0].text == "Investigated the repo."
+
+
+def test_supervisor_resume_run_restarts_paused_oracle_run_from_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / ".shmocky" / "runs" / "20260401T120000Z-resume124"
+    run_dir.mkdir(parents=True)
+    started_at = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+    noted_at = datetime(2026, 4, 1, 12, 30, tzinfo=UTC)
+    snapshot = DashboardSnapshot(
+        state=DashboardState(
+            workspace_root=str(tmp_path / "repo"),
+            event_log_path=str(run_dir / "codex-events" / "events.jsonl"),
+            connection=ConnectionState(backend_online=True, codex_connected=False),
+            thread=ThreadState(id="thread-9", status="idle"),
+            transcript=[
+                TranscriptItem(
+                    item_id="assistant-1",
+                    role="assistant",
+                    text="Investigated the repo.",
+                    status="completed",
+                    turn_id="turn-1",
+                )
+            ],
+            workflow_run=WorkflowRunState(
+                id="20260401T120000Z-resume124",
+                run_name="oracle resume",
+                workflow_id="plan_execute_judge",
+                target_dir=str(tmp_path / "repo"),
+                goal="Keep the run resumable.",
+                status="paused",
+                phase="paused",
+                codex_agent_id="engineer",
+                expert_agent_id="expert",
+                judge_agent_id="judge",
+                started_at=started_at,
+                updated_at=noted_at,
+                current_loop=2,
+                max_loops=4,
+                judge_calls=1,
+                max_judge_calls=4,
+                max_runtime_minutes=45,
+                last_plan="Plan",
+                last_codex_output="Codex output",
+                oracle_resume_checkpoint=OracleResumeCheckpoint(
+                    agent_label="expert",
+                    agent_id="expert",
+                    thread_id="thread-9",
+                    loop_index=2,
+                    prompt="Assess the current run.",
+                    detail="Oracle timed out.",
+                    noted_at=noted_at,
+                ),
+                last_error="Oracle expert failed and the run is paused: Oracle timed out.",
+            ),
+        ),
+        recent_events=[],
+        recent_workflow_events=[],
+    )
+    (run_dir / WorkflowSupervisor.RUN_SNAPSHOT_FILENAME).write_text(
+        snapshot.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    (run_dir / WorkflowSupervisor.RUN_MANIFEST_FILENAME).write_text(
+        """{
+  "runId": "20260401T120000Z-resume124",
+  "workflow": {
+    "id": "plan_execute_judge",
+    "kind": "linear_loop",
+    "planner_agent": "engineer",
+    "executor_agent": "engineer",
+    "expert_agent": "expert",
+    "judge_agent": "judge",
+    "plan_prompt_template": "Plan {goal}",
+    "execute_prompt_template": "Execute {plan}",
+    "expert_prompt_template": "Expert {judge_bundle}",
+    "judge_prompt_template": "Judge {judge_bundle}",
+    "max_loops": 4,
+    "max_runtime_minutes": 45,
+    "max_judge_calls": 4
+  },
+  "agents": {
+    "codex": {
+      "id": "engineer",
+      "provider": "codex",
+      "role": "engineer",
+      "model": "gpt-5.3-codex-spark"
+    },
+    "expert": {
+      "id": "expert",
+      "provider": "oracle",
+      "role": "expert",
+      "timeout_seconds": 3600
+    },
+    "judge": {
+      "id": "judge",
+      "provider": "codex",
+      "role": "judge",
+      "model": "gpt-5.4"
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            run_log_dir=tmp_path / ".shmocky" / "runs",
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+
+    recorded: dict[str, object] = {}
+
+    async def fake_start_bridge(
+        target_dir: Path,
+        codex_agent: object,
+        *,
+        resume_thread_id: str | None = None,
+        transcript_seed: list[TranscriptItem] | None = None,
+    ) -> None:
+        recorded["target_dir"] = str(target_dir)
+        recorded["resume_thread_id"] = resume_thread_id
+        recorded["transcript_seed_count"] = len(transcript_seed or [])
+        recorded["codex_role"] = getattr(codex_agent, "role")
+
+    async def fake_resume_from_oracle_checkpoint(context: LoadedRunContext) -> None:
+        recorded["workflow_id"] = context.workflow.id
+        recorded["expert_agent_id"] = context.expert_agent.id if context.expert_agent else None
+
+    cast(Any, supervisor)._start_bridge = fake_start_bridge
+    cast(Any, supervisor)._resume_from_oracle_checkpoint = fake_resume_from_oracle_checkpoint
+
+    async def exercise() -> DashboardSnapshot:
+        resumed = await supervisor.resume_run()
+        if supervisor._run_task is not None:
+            await supervisor._run_task
+        return resumed
+
+    resumed = asyncio.run(exercise())
+
+    assert resumed.state.workflow_run is not None
+    assert resumed.state.workflow_run.status == "running"
+    assert recorded == {
+        "target_dir": str(tmp_path / "repo"),
+        "resume_thread_id": "thread-9",
+        "transcript_seed_count": 1,
+        "codex_role": "engineer",
+        "workflow_id": "plan_execute_judge",
+        "expert_agent_id": "expert",
+    }

@@ -16,6 +16,7 @@ from .models import (
     EventDirection,
     EventMessageType,
     RawEventRecord,
+    TranscriptItem,
     StreamEnvelope,
 )
 from .projection import SessionProjection
@@ -108,6 +109,35 @@ class CodexAppServerBridge:
             recent_events=[event.model_copy(deep=True) for event in self._recent_events],
         )
 
+    async def resume_thread(self, thread_id: str) -> DashboardSnapshot:
+        async with self._thread_lock:
+            state = self._projection.snapshot()
+            if state.thread is None or state.thread.id != thread_id:
+                config: dict[str, Any] = {}
+                if self._agent_config.reasoning_effort is not None:
+                    config["model_reasoning_effort"] = self._agent_config.reasoning_effort
+                if self._agent_config.web_access is not None:
+                    config["web_search"] = self._agent_config.web_access
+                await self._call(
+                    "thread/resume",
+                    {
+                        "threadId": thread_id,
+                        "cwd": str(self._workspace_root),
+                        "approvalPolicy": self._agent_config.approval_policy,
+                        "sandbox": self._agent_config.sandbox_mode,
+                        "developerInstructions": self._agent_config.startup_prompt,
+                        "model": self._agent_config.model,
+                        "modelProvider": self._agent_config.model_provider,
+                        "serviceTier": self._agent_config.service_tier,
+                        "config": config or None,
+                    },
+                )
+        return self.snapshot()
+
+    def seed_transcript(self, items: list[TranscriptItem]) -> DashboardSnapshot:
+        self._projection.seed_transcript(items)
+        return self.snapshot()
+
     async def ensure_thread(self) -> DashboardSnapshot:
         async with self._thread_lock:
             state = self._projection.snapshot()
@@ -166,6 +196,27 @@ class CodexAppServerBridge:
         )
         return self.snapshot()
 
+    async def resolve_server_request(self, request_id: str, *, result: Any) -> DashboardSnapshot:
+        state = self._projection.snapshot()
+        pending = state.pending_server_request
+        if pending is None:
+            raise BridgeError("There is no pending server request to resolve.")
+        if pending.request_id != request_id:
+            raise BridgeError(
+                f"Pending server request is '{pending.request_id}', not '{request_id}'."
+            )
+        await self._send_message(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": result,
+            },
+            direction="outbound",
+            channel="rpc",
+            message_type="response",
+        )
+        return self.snapshot()
+
     async def wait_for_turn_completion(self, turn_id: str) -> DashboardSnapshot:
         queue = await self.subscribe()
         try:
@@ -207,11 +258,13 @@ class CodexAppServerBridge:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending[request_id] = (method, future)
-        await self._record_event(message, direction="outbound", channel="rpc", message_type="request")
-        encoded = json.dumps(message, separators=(",", ":")) + "\n"
-        async with self._send_lock:
-            self._process.stdin.write(encoded.encode("utf-8"))
-            await self._process.stdin.drain()
+        await self._send_message(
+            message,
+            direction="outbound",
+            channel="rpc",
+            message_type="request",
+            method=method,
+        )
         try:
             response = await asyncio.wait_for(
                 future,
@@ -295,8 +348,36 @@ class CodexAppServerBridge:
         elif message_type == "server_request":
             request_id = str(message.get("id"))
             method = str(message.get("method"))
-            self._projection.apply_server_request(request_id=request_id, method=method)
+            params = message.get("params")
+            self._projection.apply_server_request(
+                request_id=request_id,
+                method=method,
+                params=params if isinstance(params, dict) else None,
+            )
         await self._broadcast_event(record)
+
+    async def _send_message(
+        self,
+        message: dict[str, Any],
+        *,
+        direction: EventDirection,
+        channel: EventChannel,
+        message_type: EventMessageType,
+        method: str | None = None,
+    ) -> None:
+        if self._process is None or self._process.stdin is None:
+            raise BridgeError("codex app-server is not running")
+        await self._record_event(
+            message,
+            direction=direction,
+            channel=channel,
+            message_type=message_type,
+            method=method,
+        )
+        encoded = json.dumps(message, separators=(",", ":")) + "\n"
+        async with self._send_lock:
+            self._process.stdin.write(encoded.encode("utf-8"))
+            await self._process.stdin.drain()
 
     async def _record_event(
         self,

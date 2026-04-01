@@ -89,6 +89,7 @@ class TranscriptItem(BaseModel):
 class PendingServerRequest(BaseModel):
     request_id: str
     method: str
+    params: dict[str, Any] | None = None
     noted_at: datetime
 
 
@@ -131,6 +132,10 @@ class StreamEnvelope(BaseModel):
 
 class PromptRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20_000)
+
+
+class ServerRequestResolutionRequest(BaseModel):
+    result: Any = None
 
 
 class OracleQueryRequest(BaseModel):
@@ -234,6 +239,16 @@ class RunHistoryResponse(BaseModel):
     runs: list[RunHistoryEntry] = Field(default_factory=list)
 
 
+class OracleResumeCheckpoint(BaseModel):
+    agent_label: Literal["expert", "judge"]
+    agent_id: str
+    thread_id: str
+    loop_index: int = Field(ge=1)
+    prompt: str = Field(min_length=1, max_length=50_000)
+    detail: str | None = None
+    noted_at: datetime
+
+
 class WorkflowRunRequest(BaseModel):
     run_name: str | None = Field(default=None, min_length=1, max_length=200)
     workflow_id: str = Field(min_length=1, max_length=200)
@@ -278,6 +293,7 @@ class WorkflowRunState(BaseModel):
     last_judge_decision: WorkflowDecisionType | None = None
     last_judge_summary: str | None = None
     last_continuation_prompt: str | None = Field(default=None, max_length=20_000)
+    oracle_resume_checkpoint: OracleResumeCheckpoint | None = None
     last_error: str | None = None
     pause_requested: bool = False
     stop_requested: bool = False

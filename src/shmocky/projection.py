@@ -51,7 +51,7 @@ class SessionProjection:
             self._state.connection.platform_family = result.get("platformFamily")
             self._state.connection.platform_os = result.get("platformOs")
             return
-        if method == "thread/start" and result is not None:
+        if method in {"thread/start", "thread/resume"} and result is not None:
             self._update_thread(result.get("thread"), response=result)
             return
         if method == "turn/start" and result is not None:
@@ -88,14 +88,28 @@ class SessionProjection:
             case "item/agentMessage/delta":
                 self._append_agent_delta(params)
             case "serverRequest/resolved":
+                request_id = params.get("requestId", params.get("id"))
                 if self._state.pending_server_request is not None:
-                    if self._state.pending_server_request.request_id == str(params.get("id")):
+                    if self._state.pending_server_request.request_id == str(request_id):
                         self._state.pending_server_request = None
 
-    def apply_server_request(self, request_id: str, method: str) -> None:
+    def seed_transcript(self, items: list[TranscriptItem]) -> None:
+        self._transcript.clear()
+        for item in items:
+            self._transcript[item.item_id] = item.model_copy(deep=True)
+        self._trim_transcript()
+
+    def apply_server_request(
+        self,
+        request_id: str,
+        method: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> None:
         self._state.pending_server_request = PendingServerRequest(
             request_id=request_id,
             method=method,
+            params=params,
             noted_at=datetime.now(UTC),
         )
 

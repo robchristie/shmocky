@@ -12,6 +12,7 @@ from .models import (
     OracleQueryResponse,
     PromptRequest,
     RunHistoryResponse,
+    ServerRequestResolutionRequest,
     StreamEnvelope,
     WorkflowCatalogResponse,
     WorkflowRunRequest,
@@ -104,6 +105,19 @@ def create_app() -> FastAPI:
     async def interrupt_turn() -> DashboardSnapshot:
         try:
             return await supervisor.interrupt_turn()
+        except Exception as exc:
+            raise as_http_error(exc) from exc
+
+    @app.post(
+        "/api/server-requests/{request_id}/resolve",
+        response_model=DashboardSnapshot,
+    )
+    async def resolve_server_request(
+        request_id: str,
+        payload: ServerRequestResolutionRequest,
+    ) -> DashboardSnapshot:
+        try:
+            return await supervisor.resolve_server_request(request_id, payload)
         except Exception as exc:
             raise as_http_error(exc) from exc
 

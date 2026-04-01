@@ -8,8 +8,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from time import monotonic
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -18,21 +17,26 @@ from pydantic import ValidationError
 from .bridge import BridgeError, CodexAppServerBridge
 from .event_store import WorkflowEventStore
 from .models import (
+    AgentDefinition,
     CodexAgentConfig,
     ConnectionState,
     DashboardSnapshot,
     DashboardState,
     JudgeDecision,
     OracleQueryRequest,
+    OracleResumeCheckpoint,
     RunHistoryEntry,
     RunHistoryResponse,
-    WorkflowPhase,
-    WorkflowRunStatus,
+    ServerRequestResolutionRequest,
     StreamEnvelope,
+    TranscriptItem,
     WorkflowCatalogResponse,
+    WorkflowDefinition,
     WorkflowEventRecord,
+    WorkflowPhase,
     WorkflowRunRequest,
     WorkflowRunState,
+    WorkflowRunStatus,
     WorkflowSteerRequest,
 )
 from .oracle_agent import OracleAgent, OracleAgentError, OracleNotConfiguredError
@@ -62,6 +66,14 @@ class RunResources:
     workflow_event_store: WorkflowEventStore
 
 
+@dataclass(slots=True)
+class LoadedRunContext:
+    workflow: WorkflowDefinition
+    codex_agent: AgentDefinition
+    expert_agent: AgentDefinition | None
+    judge_agent: AgentDefinition
+
+
 class WorkflowSupervisor:
     RUN_MANIFEST_FILENAME = "run.json"
     RUN_SNAPSHOT_FILENAME = "dashboard-snapshot.json"
@@ -83,6 +95,112 @@ class WorkflowSupervisor:
         self._pause_gate = asyncio.Event()
         self._pause_gate.set()
         self._last_catalog_error: str | None = None
+        self._restore_resumable_run()
+
+    def _restore_resumable_run(self) -> None:
+        run_dir = self._find_resumable_run_dir()
+        if run_dir is None:
+            return
+        snapshot_path = run_dir / self.RUN_SNAPSHOT_FILENAME
+        try:
+            snapshot = DashboardSnapshot.model_validate_json(
+                snapshot_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            return
+        workflow_run = snapshot.state.workflow_run
+        if (
+            workflow_run is None
+            or workflow_run.status != "paused"
+            or workflow_run.oracle_resume_checkpoint is None
+        ):
+            return
+        self._run_state = workflow_run
+        self._resources = RunResources(
+            run_dir=run_dir,
+            workflow_event_store=WorkflowEventStore(run_dir / "workflow-events.jsonl"),
+        )
+        self._recent_workflow_events.clear()
+        self._recent_workflow_events.extend(
+            self._load_workflow_events(run_dir / "workflow-events.jsonl")
+        )
+        self._archived_snapshot = snapshot
+        self._pause_gate.clear()
+
+    def _find_resumable_run_dir(self) -> Path | None:
+        for run_dir in sorted(
+            self._settings.run_log_dir.glob("*"),
+            key=lambda path: path.name,
+            reverse=True,
+        ):
+            if not run_dir.is_dir():
+                continue
+            snapshot_path = run_dir / self.RUN_SNAPSHOT_FILENAME
+            if not snapshot_path.exists():
+                continue
+            try:
+                snapshot = DashboardSnapshot.model_validate_json(
+                    snapshot_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                continue
+            workflow_run = snapshot.state.workflow_run
+            if (
+                workflow_run is not None
+                and workflow_run.status == "paused"
+                and workflow_run.oracle_resume_checkpoint is not None
+            ):
+                return run_dir
+        return None
+
+    @staticmethod
+    def _load_workflow_events(path: Path) -> list[WorkflowEventRecord]:
+        if not path.exists():
+            return []
+        records: list[WorkflowEventRecord] = []
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        records.append(WorkflowEventRecord.model_validate_json(line))
+                    except Exception:
+                        continue
+        except OSError:
+            return []
+        return records[-200:]
+
+    def _load_run_context_from_manifest(self) -> LoadedRunContext:
+        if self._resources is None:
+            raise WorkflowSupervisorError("No workflow resources are available.")
+        manifest_path = self._resources.run_dir / self.RUN_MANIFEST_FILENAME
+        if not manifest_path.exists():
+            raise WorkflowSupervisorError(
+                f"Run manifest is missing for '{self._resources.run_dir.name}'."
+            )
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            workflow = WorkflowDefinition.model_validate(payload["workflow"])
+            agents_payload = payload["agents"]
+            codex_agent = AgentDefinition.model_validate(agents_payload["codex"])
+            expert_payload = agents_payload.get("expert")
+            expert_agent = (
+                AgentDefinition.model_validate(expert_payload)
+                if isinstance(expert_payload, dict)
+                else None
+            )
+            judge_agent = AgentDefinition.model_validate(agents_payload["judge"])
+        except Exception as exc:
+            raise WorkflowSupervisorError(
+                f"Run manifest for '{self._resources.run_dir.name}' is unreadable."
+            ) from exc
+        return LoadedRunContext(
+            workflow=workflow,
+            codex_agent=codex_agent,
+            expert_agent=expert_agent,
+            judge_agent=judge_agent,
+        )
 
     def snapshot(self) -> DashboardSnapshot:
         if self._bridge is None and self._archived_snapshot is not None:
@@ -221,6 +339,12 @@ class WorkflowSupervisor:
                     pass
                 self._run_task = None
             await self._stop_bridge()
+            if (
+                self._run_state is not None
+                and self._run_state.status == "paused"
+                and self._run_state.oracle_resume_checkpoint is not None
+            ):
+                self._persist_run_snapshot()
 
     async def start_thread(self) -> DashboardSnapshot:
         if self._bridge is None:
@@ -236,6 +360,28 @@ class WorkflowSupervisor:
         if self._bridge is None:
             raise WorkflowSupervisorError("No active Codex session. Start a workflow run first.")
         return await self._bridge.interrupt_turn()
+
+    async def resolve_server_request(
+        self,
+        request_id: str,
+        payload: ServerRequestResolutionRequest,
+    ) -> DashboardSnapshot:
+        if self._bridge is None:
+            raise WorkflowSupervisorError("No active Codex session. Start a workflow run first.")
+        pending = self._bridge.snapshot().state.pending_server_request
+        if pending is None:
+            raise WorkflowSupervisorError("There is no pending server request to resolve.")
+        if pending.request_id != request_id:
+            raise WorkflowSupervisorError(
+                f"Pending server request is '{pending.request_id}', not '{request_id}'."
+            )
+        await self._bridge.resolve_server_request(request_id, result=payload.result)
+        await self._record_workflow_event(
+            "server_request_responded",
+            f"Operator responded to {pending.method}.",
+            payload={"requestId": request_id, "method": pending.method},
+        )
+        return self.snapshot()
 
     async def start_run(self, payload: WorkflowRunRequest) -> DashboardSnapshot:
         async with self._lock:
@@ -379,6 +525,27 @@ class WorkflowSupervisor:
                 raise WorkflowSupervisorError("No workflow run exists.")
             self._run_state.pause_requested = False
             if self._run_state.status == "paused":
+                if self._run_task is None:
+                    checkpoint = self._run_state.oracle_resume_checkpoint
+                    if checkpoint is None:
+                        raise WorkflowSupervisorError(
+                            "This paused run cannot be resumed after backend restart."
+                        )
+                    context = self._load_run_context_from_manifest()
+                    transcript_seed = (
+                        self._archived_snapshot.state.transcript
+                        if self._archived_snapshot is not None
+                        else []
+                    )
+                    await self._start_bridge(
+                        Path(self._run_state.target_dir),
+                        context.codex_agent,
+                        resume_thread_id=checkpoint.thread_id,
+                        transcript_seed=transcript_seed,
+                    )
+                    self._run_task = asyncio.create_task(
+                        self._resume_from_oracle_checkpoint(context)
+                    )
                 self._run_state.status = "running"
                 self._run_state.updated_at = datetime.now(UTC)
                 self._pause_gate.set()
@@ -413,7 +580,14 @@ class WorkflowSupervisor:
             )
             return self.snapshot()
 
-    async def _start_bridge(self, target_dir: Path, codex_agent: Any) -> None:
+    async def _start_bridge(
+        self,
+        target_dir: Path,
+        codex_agent: Any,
+        *,
+        resume_thread_id: str | None = None,
+        transcript_seed: list[TranscriptItem] | None = None,
+    ) -> None:
         await self._stop_bridge()
         bridge = CodexAppServerBridge(
             self._settings,
@@ -433,14 +607,25 @@ class WorkflowSupervisor:
             ),
         )
         await bridge.start()
+        if resume_thread_id is not None:
+            await bridge.resume_thread(resume_thread_id)
+        if transcript_seed:
+            bridge.seed_transcript(transcript_seed)
         queue = await bridge.subscribe()
         self._bridge = bridge
         self._bridge_queue = queue
         self._bridge_task = asyncio.create_task(self._relay_bridge_events(queue))
         await self._record_workflow_event(
-            "codex_session_started",
-            "Started Codex app-server session for the workflow run.",
-            payload={"workspaceRoot": str(target_dir)},
+            "codex_session_resumed" if resume_thread_id is not None else "codex_session_started",
+            (
+                "Resumed Codex app-server session for the workflow run."
+                if resume_thread_id is not None
+                else "Started Codex app-server session for the workflow run."
+            ),
+            payload={
+                "workspaceRoot": str(target_dir),
+                "threadId": resume_thread_id,
+            },
         )
 
     async def _stop_bridge(self) -> None:
@@ -483,7 +668,6 @@ class WorkflowSupervisor:
         expert_agent: Any,
         judge_agent: Any,
     ) -> None:
-        started_at = monotonic()
         try:
             await self._ensure_checkpoint("planning", "Planning with Codex.")
             plan_prompt = self._render_template(
@@ -499,126 +683,14 @@ class WorkflowSupervisor:
                 goal=self._run_state.goal,
                 plan=plan_output,
             )
-
-            execute_prompt = initial_execute_prompt
-            loop_index = 0
-            while True:
-                loop_index += 1
-                await self._check_budgets(loop_index, started_at)
-                if self._run_state is None:
-                    raise WorkflowSupervisorError("Workflow run disappeared during execution.")
-                self._run_state.current_loop = loop_index
-                self._run_state.updated_at = datetime.now(UTC)
-
-                await self._ensure_checkpoint("executing", f"Codex execution loop {loop_index}.")
-                execute_prompt = self._consume_steering(execute_prompt)
-                codex_output = await self._run_codex_turn(execute_prompt, kind="executing")
-                if self._run_state is None:
-                    raise WorkflowSupervisorError("Workflow run disappeared during judging.")
-                self._run_state.last_codex_output = self._clip(codex_output)
-
-                expert_assessment: str | None = None
-                if expert_agent is not None and workflow.expert_prompt_template is not None:
-                    await self._ensure_checkpoint(
-                        "advising",
-                        f"Expert assessment loop {loop_index}.",
-                    )
-                    expert_bundle = await self._build_judge_bundle(
-                        codex_output,
-                        expert_assessment=None,
-                    )
-                    expert_prompt = self._render_agent_prompt(
-                        workflow.expert_prompt_template,
-                        agent=expert_agent,
-                        goal=self._run_state.goal or "",
-                        plan=plan_output,
-                        last_output=codex_output,
-                        judge_bundle=expert_bundle,
-                        expert_assessment="",
-                    )
-                    while True:
-                        try:
-                            expert_assessment = await self._run_expert(expert_agent, expert_prompt)
-                            break
-                        except (OracleAgentError, OracleNotConfiguredError) as exc:
-                            if expert_agent.provider != "oracle":
-                                raise
-                            await self._pause_for_oracle_failure(
-                                agent_label="expert",
-                                detail=str(exc),
-                            )
-                    if self._run_state is None:
-                        raise WorkflowSupervisorError(
-                            "Workflow run disappeared during expert assessment."
-                        )
-                    if self._run_state.last_error and self._run_state.last_error.startswith(
-                        "Oracle expert failed and the run is paused:"
-                    ):
-                        self._run_state.last_error = None
-                    self._run_state.last_expert_assessment = self._clip(
-                        expert_assessment,
-                        limit=8_000,
-                    )
-
-                await self._ensure_checkpoint("judging", f"Judge evaluation loop {loop_index}.")
-                await self._check_budgets(loop_index, started_at, before_judge=True)
-                judge_bundle = await self._build_judge_bundle(
-                    codex_output,
-                    expert_assessment=expert_assessment,
-                )
-                judge_prompt = self._render_agent_prompt(
-                    workflow.judge_prompt_template,
-                    agent=judge_agent,
-                    goal=self._run_state.goal or "",
-                    plan=plan_output,
-                    last_output=codex_output,
-                    judge_bundle=judge_bundle,
-                    expert_assessment=expert_assessment or "",
-                )
-                while True:
-                    try:
-                        decision = await self._run_judge(judge_agent, judge_prompt)
-                        break
-                    except (OracleAgentError, OracleNotConfiguredError) as exc:
-                        if judge_agent.provider != "oracle":
-                            raise
-                        await self._pause_for_oracle_failure(
-                            agent_label="judge",
-                            detail=str(exc),
-                        )
-                if self._run_state is None:
-                    raise WorkflowSupervisorError("Workflow run disappeared after judging.")
-                if self._run_state.last_error and self._run_state.last_error.startswith(
-                    "Oracle judge failed and the run is paused:"
-                ):
-                    self._run_state.last_error = None
-                self._run_state.judge_calls += 1
-                self._run_state.last_judge_decision = decision.decision
-                self._run_state.last_judge_summary = decision.summary
-                self._run_state.last_continuation_prompt = (
-                    decision.next_prompt if decision.decision == "continue" else None
-                )
-                self._run_state.updated_at = datetime.now(UTC)
-
-                if decision.decision == "complete":
-                    await self._finish_run(
-                        status="completed",
-                        phase="completed",
-                        note=decision.completion_note or decision.summary,
-                    )
-                    return
-                if decision.decision == "fail":
-                    await self._finish_run(
-                        status="failed",
-                        phase="failed",
-                        note=decision.failure_reason or decision.summary,
-                    )
-                    return
-                if not decision.next_prompt:
-                    raise WorkflowSupervisorError(
-                        "Judge returned continue without a next_prompt."
-                    )
-                execute_prompt = decision.next_prompt
+            await self._execute_remaining_loops(
+                workflow,
+                plan_output,
+                initial_execute_prompt,
+                start_loop=1,
+                expert_agent=expert_agent,
+                judge_agent=judge_agent,
+            )
         except WorkflowStoppedError:
             await self._finish_run(
                 status="stopped",
@@ -629,6 +701,250 @@ class WorkflowSupervisor:
             await self._finish_run(status="failed", phase="failed", note=str(exc))
         except Exception as exc:  # pragma: no cover - defensive path
             await self._finish_run(status="failed", phase="failed", note=str(exc))
+
+    async def _resume_from_oracle_checkpoint(self, context: LoadedRunContext) -> None:
+        try:
+            if self._run_state is None:
+                raise WorkflowSupervisorError("No workflow run exists.")
+            checkpoint = self._run_state.oracle_resume_checkpoint
+            if checkpoint is None:
+                raise WorkflowSupervisorError("No Oracle resume checkpoint is available.")
+            if self._run_state.last_codex_output is None:
+                raise WorkflowSupervisorError(
+                    "Cannot resume Oracle-blocked run without preserved Codex output."
+                )
+            loop_index = checkpoint.loop_index
+            plan_output = self._run_state.last_plan or ""
+            codex_output = self._run_state.last_codex_output
+            expert_assessment = self._run_state.last_expert_assessment
+
+            if checkpoint.agent_label == "expert":
+                expert_agent = context.expert_agent
+                if expert_agent is None or context.workflow.expert_prompt_template is None:
+                    raise WorkflowSupervisorError(
+                        "Cannot resume expert step because the expert agent is missing."
+                    )
+                await self._ensure_checkpoint(
+                    "advising",
+                    f"Resuming expert assessment loop {loop_index}.",
+                )
+                while True:
+                    try:
+                        expert_assessment = await self._run_expert(expert_agent, checkpoint.prompt)
+                        break
+                    except (OracleAgentError, OracleNotConfiguredError) as exc:
+                        if expert_agent.provider != "oracle":
+                            raise
+                        await self._pause_for_oracle_failure(
+                            agent_label="expert",
+                            agent_id=expert_agent.id,
+                            prompt=checkpoint.prompt,
+                            detail=str(exc),
+                        )
+                if self._run_state is None:
+                    raise WorkflowSupervisorError(
+                        "Workflow run disappeared during expert assessment."
+                    )
+                self._clear_oracle_pause("expert")
+                self._run_state.last_expert_assessment = self._clip(
+                    expert_assessment,
+                    limit=8_000,
+                )
+                await self._ensure_checkpoint("judging", f"Judge evaluation loop {loop_index}.")
+                await self._check_budgets(loop_index, before_judge=True)
+                judge_bundle = await self._build_judge_bundle(
+                    codex_output,
+                    expert_assessment=expert_assessment,
+                )
+                judge_prompt = self._render_agent_prompt(
+                    context.workflow.judge_prompt_template,
+                    agent=context.judge_agent,
+                    goal=self._run_state.goal or "",
+                    plan=plan_output,
+                    last_output=codex_output,
+                    judge_bundle=judge_bundle,
+                    expert_assessment=expert_assessment or "",
+                )
+            else:
+                await self._ensure_checkpoint(
+                    "judging",
+                    f"Resuming judge evaluation loop {loop_index}.",
+                )
+                await self._check_budgets(loop_index, before_judge=True)
+                judge_prompt = checkpoint.prompt
+
+            while True:
+                try:
+                    decision = await self._run_judge(context.judge_agent, judge_prompt)
+                    break
+                except (OracleAgentError, OracleNotConfiguredError) as exc:
+                    if context.judge_agent.provider != "oracle":
+                        raise
+                    await self._pause_for_oracle_failure(
+                        agent_label="judge",
+                        agent_id=context.judge_agent.id,
+                        prompt=judge_prompt,
+                        detail=str(exc),
+                    )
+            if self._run_state is None:
+                raise WorkflowSupervisorError("Workflow run disappeared after judging.")
+            self._clear_oracle_pause("judge")
+            next_prompt = await self._apply_judge_decision(decision)
+            if next_prompt is None:
+                return
+            await self._execute_remaining_loops(
+                context.workflow,
+                plan_output,
+                next_prompt,
+                start_loop=loop_index + 1,
+                expert_agent=context.expert_agent,
+                judge_agent=context.judge_agent,
+            )
+        except WorkflowStoppedError:
+            await self._finish_run(
+                status="stopped",
+                phase="stopped",
+                note="Workflow run stopped by operator request.",
+            )
+        except (BridgeError, OracleAgentError, OracleNotConfiguredError, WorkflowSupervisorError) as exc:
+            await self._finish_run(status="failed", phase="failed", note=str(exc))
+        except Exception as exc:  # pragma: no cover - defensive path
+            await self._finish_run(status="failed", phase="failed", note=str(exc))
+
+    async def _execute_remaining_loops(
+        self,
+        workflow: Any,
+        plan_output: str,
+        execute_prompt: str,
+        *,
+        start_loop: int,
+        expert_agent: Any,
+        judge_agent: Any,
+    ) -> None:
+        loop_index = start_loop - 1
+        while True:
+            loop_index += 1
+            await self._check_budgets(loop_index)
+            if self._run_state is None:
+                raise WorkflowSupervisorError("Workflow run disappeared during execution.")
+            self._run_state.current_loop = loop_index
+            self._run_state.updated_at = datetime.now(UTC)
+
+            await self._ensure_checkpoint("executing", f"Codex execution loop {loop_index}.")
+            execute_prompt = self._consume_steering(execute_prompt)
+            codex_output = await self._run_codex_turn(execute_prompt, kind="executing")
+            if self._run_state is None:
+                raise WorkflowSupervisorError("Workflow run disappeared during judging.")
+            self._run_state.last_codex_output = self._clip(codex_output)
+
+            expert_assessment: str | None = None
+            if expert_agent is not None and workflow.expert_prompt_template is not None:
+                await self._ensure_checkpoint(
+                    "advising",
+                    f"Expert assessment loop {loop_index}.",
+                )
+                expert_bundle = await self._build_judge_bundle(
+                    codex_output,
+                    expert_assessment=None,
+                )
+                expert_prompt = self._render_agent_prompt(
+                    workflow.expert_prompt_template,
+                    agent=expert_agent,
+                    goal=self._run_state.goal or "",
+                    plan=plan_output,
+                    last_output=codex_output,
+                    judge_bundle=expert_bundle,
+                    expert_assessment="",
+                )
+                while True:
+                    try:
+                        expert_assessment = await self._run_expert(expert_agent, expert_prompt)
+                        break
+                    except (OracleAgentError, OracleNotConfiguredError) as exc:
+                        if expert_agent.provider != "oracle":
+                            raise
+                        await self._pause_for_oracle_failure(
+                            agent_label="expert",
+                            agent_id=expert_agent.id,
+                            prompt=expert_prompt,
+                            detail=str(exc),
+                        )
+                if self._run_state is None:
+                    raise WorkflowSupervisorError(
+                        "Workflow run disappeared during expert assessment."
+                    )
+                self._clear_oracle_pause("expert")
+                self._run_state.last_expert_assessment = self._clip(
+                    expert_assessment,
+                    limit=8_000,
+                )
+
+            await self._ensure_checkpoint("judging", f"Judge evaluation loop {loop_index}.")
+            await self._check_budgets(loop_index, before_judge=True)
+            judge_bundle = await self._build_judge_bundle(
+                codex_output,
+                expert_assessment=expert_assessment,
+            )
+            judge_prompt = self._render_agent_prompt(
+                workflow.judge_prompt_template,
+                agent=judge_agent,
+                goal=self._run_state.goal or "",
+                plan=plan_output,
+                last_output=codex_output,
+                judge_bundle=judge_bundle,
+                expert_assessment=expert_assessment or "",
+            )
+            while True:
+                try:
+                    decision = await self._run_judge(judge_agent, judge_prompt)
+                    break
+                except (OracleAgentError, OracleNotConfiguredError) as exc:
+                    if judge_agent.provider != "oracle":
+                        raise
+                    await self._pause_for_oracle_failure(
+                        agent_label="judge",
+                        agent_id=judge_agent.id,
+                        prompt=judge_prompt,
+                        detail=str(exc),
+                    )
+            if self._run_state is None:
+                raise WorkflowSupervisorError("Workflow run disappeared after judging.")
+            self._clear_oracle_pause("judge")
+            next_prompt = await self._apply_judge_decision(decision)
+            if next_prompt is None:
+                return
+            execute_prompt = next_prompt
+
+    async def _apply_judge_decision(self, decision: JudgeDecision) -> str | None:
+        if self._run_state is None:
+            raise WorkflowSupervisorError("Workflow run disappeared after judging.")
+        self._run_state.judge_calls += 1
+        self._run_state.last_judge_decision = decision.decision
+        self._run_state.last_judge_summary = decision.summary
+        self._run_state.last_continuation_prompt = (
+            decision.next_prompt if decision.decision == "continue" else None
+        )
+        self._run_state.updated_at = datetime.now(UTC)
+
+        if decision.decision == "complete":
+            await self._finish_run(
+                status="completed",
+                phase="completed",
+                note=decision.completion_note or decision.summary,
+            )
+            return None
+        if decision.decision == "fail":
+            await self._finish_run(
+                status="failed",
+                phase="failed",
+                note=decision.failure_reason or decision.summary,
+            )
+            return None
+        if not decision.next_prompt:
+            raise WorkflowSupervisorError(
+                "Judge returned continue without a next_prompt."
+            )
+        return decision.next_prompt
 
     async def _run_codex_turn(self, prompt: str, *, kind: str) -> str:
         if self._bridge is None:
@@ -760,13 +1076,12 @@ class WorkflowSupervisor:
     async def _check_budgets(
         self,
         loop_index: int,
-        started_at: float,
         *,
         before_judge: bool = False,
     ) -> None:
         if self._run_state is None:
             raise WorkflowSupervisorError("No workflow state is available.")
-        elapsed_minutes = (monotonic() - started_at) / 60
+        elapsed_minutes = (datetime.now(UTC) - self._run_state.started_at).total_seconds() / 60
         if elapsed_minutes >= self._run_state.max_runtime_minutes:
             raise WorkflowSupervisorError(
                 f"Workflow runtime budget exceeded ({self._run_state.max_runtime_minutes} minutes)."
@@ -780,12 +1095,48 @@ class WorkflowSupervisor:
                 f"Workflow judge-call budget exceeded ({self._run_state.max_judge_calls} calls)."
             )
 
-    async def _pause_for_oracle_failure(self, *, agent_label: str, detail: str) -> None:
+    def _clear_oracle_pause(self, agent_label: Literal["expert", "judge"]) -> None:
+        if self._run_state is None:
+            return
+        checkpoint = self._run_state.oracle_resume_checkpoint
+        if checkpoint is not None and checkpoint.agent_label == agent_label:
+            self._run_state.oracle_resume_checkpoint = None
+        prefix = f"Oracle {agent_label} failed and the run is paused:"
+        if self._run_state.last_error and self._run_state.last_error.startswith(prefix):
+            self._run_state.last_error = None
+        self._run_state.updated_at = datetime.now(UTC)
+
+    async def _pause_for_oracle_failure(
+        self,
+        *,
+        agent_label: Literal["expert", "judge"],
+        agent_id: str,
+        prompt: str,
+        detail: str,
+    ) -> None:
         if self._run_state is None:
             raise WorkflowSupervisorError("No workflow run exists.")
+        thread_id: str | None = None
+        if self._bridge is not None:
+            bridge_thread = self._bridge.snapshot().state.thread
+            if bridge_thread is not None:
+                thread_id = bridge_thread.id
+        elif self._archived_snapshot is not None and self._archived_snapshot.state.thread is not None:
+            thread_id = self._archived_snapshot.state.thread.id
+        if thread_id is None:
+            raise WorkflowSupervisorError("Cannot pause for Oracle failure without a Codex thread.")
         self._pause_gate.clear()
         self._run_state.status = "paused"
         self._run_state.phase = "paused"
+        self._run_state.oracle_resume_checkpoint = OracleResumeCheckpoint(
+            agent_label=agent_label,
+            agent_id=agent_id,
+            thread_id=thread_id,
+            loop_index=max(1, self._run_state.current_loop),
+            prompt=prompt,
+            detail=detail,
+            noted_at=datetime.now(UTC),
+        )
         self._run_state.last_error = (
             f"Oracle {agent_label} failed and the run is paused: {detail}"
         )
@@ -793,7 +1144,13 @@ class WorkflowSupervisor:
         await self._record_workflow_event(
             "oracle_blocked",
             f"Oracle {agent_label} failed; run paused until operator resume.",
-            payload={"agent": agent_label, "detail": detail},
+            payload={
+                "agent": agent_label,
+                "agentId": agent_id,
+                "detail": detail,
+                "threadId": thread_id,
+                "loop": self._run_state.current_loop,
+            },
         )
         await self._broadcast_state()
         await self._pause_gate.wait()
@@ -833,6 +1190,7 @@ class WorkflowSupervisor:
         if self._run_state is not None:
             self._run_state.status = status
             self._run_state.phase = phase
+            self._run_state.oracle_resume_checkpoint = None
             self._run_state.last_error = note if status == "failed" else None
             self._run_state.completed_at = datetime.now(UTC)
             self._run_state.updated_at = datetime.now(UTC)

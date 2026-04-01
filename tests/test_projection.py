@@ -99,12 +99,27 @@ def test_projection_tracks_server_requests() -> None:
         event_log_path="/tmp/workspace/.shmocky/events/test.jsonl",
     )
 
-    projection.apply_server_request("42", "item/commandExecution/requestApproval")
+    projection.apply_server_request(
+        "42",
+        "item/commandExecution/requestApproval",
+        params={"command": "git status", "reason": "Needs approval."},
+    )
     snapshot = projection.snapshot()
 
     assert snapshot.pending_server_request is not None
     assert snapshot.pending_server_request.request_id == "42"
     assert snapshot.pending_server_request.method == "item/commandExecution/requestApproval"
+    assert snapshot.pending_server_request.params == {
+        "command": "git status",
+        "reason": "Needs approval.",
+    }
+
+    projection.apply_notification(
+        "serverRequest/resolved",
+        {"requestId": "42", "threadId": "thread-1"},
+    )
+
+    assert projection.snapshot().pending_server_request is None
 
 
 def test_thread_started_notification_preserves_response_metadata() -> None:

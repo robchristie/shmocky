@@ -42,6 +42,7 @@ export interface TranscriptItem {
 export interface PendingServerRequest {
 	request_id: string;
 	method: string;
+	params: Record<string, unknown> | null;
 	noted_at: string;
 }
 
@@ -132,6 +133,16 @@ export interface WorkflowCatalogResponse {
 	workflows: WorkflowDefinition[];
 }
 
+export interface OracleResumeCheckpoint {
+	agent_label: "expert" | "judge";
+	agent_id: string;
+	thread_id: string;
+	loop_index: number;
+	prompt: string;
+	detail: string | null;
+	noted_at: string;
+}
+
 export interface RunHistoryEntry {
 	id: string;
 	run_name: string | null;
@@ -208,6 +219,7 @@ export interface WorkflowRunState {
 	last_judge_decision: "continue" | "complete" | "fail" | null;
 	last_judge_summary: string | null;
 	last_continuation_prompt: string | null;
+	oracle_resume_checkpoint: OracleResumeCheckpoint | null;
 	last_error: string | null;
 	pause_requested: boolean;
 	stop_requested: boolean;
