@@ -91,3 +91,4 @@ Frontend:
 - 2026-04-01: Oracle-side failures now pause workflow runs in a resumable state instead of failing outright, and the default Oracle wait budget was raised to one hour for slower browser-model calls.
 - 2026-04-01: Added live browser handling for pending app-server requests, including approval and request-user-input responses, and fixed pending-request clearing to follow the protocol's `requestId` field.
 - 2026-04-01: Added durable resume semantics for Oracle-blocked pauses by persisting a restart-safe checkpoint, restoring the paused run at startup, and resuming the saved Codex thread before retrying the blocked Oracle step.
+- 2026-04-01: Restricted Oracle file attachments to the configured workspace root, rejecting absolute paths and `..`-based escapes so ad hoc Oracle queries cannot attach arbitrary server files.

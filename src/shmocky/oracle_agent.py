@@ -145,19 +145,28 @@ class OracleAgent:
     def _resolve_files(self, patterns: list[str]) -> list[str]:
         attached_files: list[str] = []
         seen: set[Path] = set()
+        workspace_root = self._settings.workspace_root.resolve()
         for pattern in patterns:
             base_pattern = pattern.strip()
             if not base_pattern:
                 continue
             candidate_pattern = Path(base_pattern)
             if candidate_pattern.is_absolute():
-                matches = sorted(candidate_pattern.parent.glob(candidate_pattern.name))
-            else:
-                matches = sorted(self._settings.workspace_root.glob(base_pattern))
-            if not matches:
-                raise OracleAgentError(f"Oracle file pattern did not match anything: {pattern}")
+                raise OracleAgentError(
+                    "Oracle file attachments must stay within the configured workspace root."
+                )
+            matches = sorted(workspace_root.glob(base_pattern))
+            accessible_matches: list[Path] = []
             for match in matches:
                 resolved = match.resolve()
+                if not resolved.is_relative_to(workspace_root):
+                    continue
+                accessible_matches.append(resolved)
+            if not accessible_matches:
+                raise OracleAgentError(
+                    f"Oracle file pattern did not match any workspace files: {pattern}"
+                )
+            for resolved in accessible_matches:
                 if not resolved.is_file() or resolved in seen:
                     continue
                 seen.add(resolved)

@@ -8,7 +8,12 @@ import pytest
 from pydantic import SecretStr
 
 from shmocky.models import OracleQueryRequest
-from shmocky.oracle_agent import OracleAgent, OracleNotConfiguredError, OraclePromptTooLongError
+from shmocky.oracle_agent import (
+    OracleAgent,
+    OracleAgentError,
+    OracleNotConfiguredError,
+    OraclePromptTooLongError,
+)
 from shmocky.settings import AppSettings
 
 
@@ -194,3 +199,46 @@ def test_oracle_agent_passes_chatgpt_url_to_cli(
         == "https://chatgpt.com/g/g-p-69cc59b46ad08191886f589993476e6f-codex/project"
     )
     assert response.answer == "expert answer"
+
+
+def test_oracle_agent_rejects_absolute_attachment_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ORACLE_REMOTE_TOKEN", raising=False)
+    outside = tmp_path.parent / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    agent = OracleAgent(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+            oracle_remote_token=SecretStr("secret-token"),
+        )
+    )
+
+    with pytest.raises(OracleAgentError, match="workspace root"):
+        agent._resolve_files([str(outside)])
+
+
+def test_oracle_agent_rejects_parent_traversal_attachment_globs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ORACLE_REMOTE_TOKEN", raising=False)
+    outside = tmp_path.parent / "secrets" / "note.txt"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("secret", encoding="utf-8")
+
+    agent = OracleAgent(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+            oracle_remote_token=SecretStr("secret-token"),
+        )
+    )
+
+    with pytest.raises(OracleAgentError, match="workspace files"):
+        agent._resolve_files(["../secrets/*.txt"])
