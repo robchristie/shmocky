@@ -38,7 +38,7 @@ class CodexAppServerBridge:
     ) -> None:
         self._settings = settings
         self._workspace_root = (workspace_root or settings.workspace_root).expanduser().resolve()
-        self._agent_config = agent_config or CodexAgentConfig(role="engineer")
+        self._agent_config = agent_config or CodexAgentConfig(role="builder")
         event_log_root = event_log_dir or settings.event_log_dir
         event_log_path = self._make_event_log_path(event_log_root)
         self._event_store = RawEventStore(event_log_path)
@@ -190,22 +190,30 @@ class CodexAppServerBridge:
                 )
         return self.snapshot()
 
-    async def start_turn(self, prompt: str) -> DashboardSnapshot:
+    async def start_turn(
+        self,
+        prompt: str,
+        *,
+        output_schema: dict[str, Any] | None = None,
+    ) -> DashboardSnapshot:
         state = await self.ensure_thread()
         thread = state.state.thread
         if thread is None:
             raise BridgeError("Thread could not be created")
+        params: dict[str, Any] = {
+            "threadId": thread.id,
+            "input": [
+                {
+                    "type": "text",
+                    "text": prompt,
+                }
+            ],
+        }
+        if output_schema is not None:
+            params["outputSchema"] = output_schema
         await self._call(
             "turn/start",
-            {
-                "threadId": thread.id,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    }
-                ],
-            },
+            params,
         )
         return self.snapshot()
 

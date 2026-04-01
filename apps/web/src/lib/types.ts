@@ -112,11 +112,9 @@ export interface AgentDefinition {
 export interface WorkflowDefinition {
 	id: string;
 	kind: "linear_loop";
-	planner_agent: string;
 	executor_agent: string;
 	expert_agent: string | null;
 	judge_agent: string;
-	plan_prompt_template: string;
 	execute_prompt_template: string;
 	expert_prompt_template: string | null;
 	judge_prompt_template: string;
@@ -159,7 +157,6 @@ export interface RunHistoryEntry {
 		| "stopped";
 	phase:
 		| "idle"
-		| "planning"
 		| "executing"
 		| "advising"
 		| "judging"
@@ -199,7 +196,6 @@ export interface WorkflowRunState {
 		| "stopped";
 	phase:
 		| "idle"
-		| "planning"
 		| "executing"
 		| "advising"
 		| "judging"
@@ -218,7 +214,6 @@ export interface WorkflowRunState {
 	max_judge_calls: number;
 	max_runtime_minutes: number;
 	expert_agent_id: string | null;
-	last_plan: string | null;
 	last_codex_output: string | null;
 	last_expert_assessment: string | null;
 	last_judge_decision: "continue" | "complete" | "fail" | null;

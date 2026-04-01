@@ -9,23 +9,17 @@ from pydantic import ValidationError
 from .models import AgentDefinition, WorkflowCatalogResponse, WorkflowDefinition
 from .settings import AppSettings
 
-DEFAULT_PLAN_PROMPT_TEMPLATE = """You are preparing the first execution plan for this workflow run.
-
+DEFAULT_EXECUTE_PROMPT_TEMPLATE = """<builder_task>
 Goal:
 {goal}
 
-Produce a concrete implementation plan for the repository in front of you. Keep it actionable and
-focused on the next small slice that should actually be executed now."""
+Carry the repository forward to completion from the current workspace state.
 
-DEFAULT_EXECUTE_PROMPT_TEMPLATE = """Execute the next slice of work for this workflow run.
-
-Goal:
-{goal}
-
-Plan:
-{plan}
-
-Carry the work forward in the repository. If you are blocked, say exactly what blocked you."""
+Constraints:
+- Work directly in the repo instead of stopping at an up-front plan.
+- Use tools as needed until the task is actually complete or a real blocker is proven.
+- Verify meaningful changes before concluding.
+</builder_task>"""
 
 DEFAULT_EXPERT_PROMPT_TEMPLATE = """You are the workflow expert advisor. Review the run context below
 and return plain text only.
@@ -40,24 +34,20 @@ Keep the response concise but specific. Free text is fine.
 Context:
 {judge_bundle}"""
 
-DEFAULT_JUDGE_PROMPT_TEMPLATE = """You are the workflow judge. Review the run context below and
-return plain text only in this exact labeled format:
+DEFAULT_JUDGE_PROMPT_TEMPLATE = """<judge_task>
+Review the run context below and produce a strict decision object.
 
-Decision: continue | complete | fail
-Summary: short operator-facing summary
-Next prompt:
-required only when Decision is continue; plain text, may be multiline
-Completion note:
-optional only when Decision is complete
-Failure reason:
-optional only when Decision is fail
+Decision policy:
+- `continue` only when one concrete next builder prompt would materially advance the goal
+- `complete` only when the goal appears satisfied and the evidence supports stopping
+- `fail` only when the run is blocked, unsafe, or no longer viable
 
-Rules:
-- Return plain text only.
-- Choose "continue" only when a single next Codex prompt would materially advance the goal.
-- Choose "complete" only when the goal appears satisfied.
-- Choose "fail" only when the run is blocked or the approach is no longer viable.
-- If you choose "continue", write a complete next Codex prompt under "Next prompt:".
+Requirements:
+- Ground the decision in the supplied repo and run evidence
+- Keep `summary` short and operator-facing
+- If you choose `continue`, provide a complete `next_prompt`
+- Do not emit prose outside the constrained response
+</judge_task>
 
 Context:
 {judge_bundle}"""
@@ -127,7 +117,6 @@ class WorkflowConfigLoader:
                 raise WorkflowConfigError("Each workflow entry must be a TOML table.")
             workflow_payload = {
                 "id": workflow_id,
-                "plan_prompt_template": DEFAULT_PLAN_PROMPT_TEMPLATE,
                 "execute_prompt_template": DEFAULT_EXECUTE_PROMPT_TEMPLATE,
                 "expert_prompt_template": DEFAULT_EXPERT_PROMPT_TEMPLATE,
                 "judge_prompt_template": DEFAULT_JUDGE_PROMPT_TEMPLATE,
@@ -137,11 +126,7 @@ class WorkflowConfigLoader:
                 workflow = WorkflowDefinition.model_validate(workflow_payload)
             except ValidationError as exc:
                 raise WorkflowConfigError(f"Invalid workflow '{workflow_id}': {exc}") from exc
-            for ref_name in (
-                workflow.planner_agent,
-                workflow.executor_agent,
-                workflow.judge_agent,
-            ):
+            for ref_name in (workflow.executor_agent, workflow.judge_agent):
                 if ref_name not in agent_by_id:
                     raise WorkflowConfigError(
                         f"Workflow '{workflow_id}' references unknown agent '{ref_name}'."
@@ -150,7 +135,6 @@ class WorkflowConfigLoader:
                 raise WorkflowConfigError(
                     f"Workflow '{workflow_id}' references unknown agent '{workflow.expert_agent}'."
                 )
-            planner = agent_by_id[workflow.planner_agent]
             executor = agent_by_id[workflow.executor_agent]
             judge = agent_by_id[workflow.judge_agent]
             expert = (
@@ -158,13 +142,9 @@ class WorkflowConfigLoader:
                 if workflow.expert_agent is not None
                 else None
             )
-            if planner.provider != "codex" or executor.provider != "codex":
+            if executor.provider != "codex":
                 raise WorkflowConfigError(
-                    f"Workflow '{workflow_id}' must use Codex agents for planner and executor."
-                )
-            if workflow.planner_agent != workflow.executor_agent:
-                raise WorkflowConfigError(
-                    f"Workflow '{workflow_id}' must use the same Codex agent for planner and executor in v1."
+                    f"Workflow '{workflow_id}' must use a Codex agent for execution."
                 )
             if judge.provider != "codex":
                 raise WorkflowConfigError(

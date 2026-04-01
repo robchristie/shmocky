@@ -103,7 +103,6 @@ def test_supervisor_render_judge_prompt_fits_oracle_limit() -> None:
         "Context:\n{judge_bundle}",
         prompt_limit=prompt_limit,
         goal="goal",
-        plan="plan",
         last_output="output",
         judge_bundle="X" * (prompt_limit + 5_000),
     )
@@ -112,21 +111,57 @@ def test_supervisor_render_judge_prompt_fits_oracle_limit() -> None:
     assert prompt.startswith("Context:\n")
 
 
+def test_supervisor_formats_scoped_task_update_for_steering(tmp_path: Path) -> None:
+    started_at = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+    supervisor._run_state = WorkflowRunState(
+        id="run-1",
+        run_name="steering test",
+        workflow_id="plan_execute_judge",
+        target_dir=str(tmp_path / "repo"),
+        goal="Finish the task.",
+        status="running",
+        phase="executing",
+        codex_agent_id="builder",
+        judge_agent_id="judge",
+        started_at=started_at,
+        updated_at=started_at,
+        max_loops=4,
+        max_judge_calls=4,
+        max_runtime_minutes=45,
+        pending_steering_notes=["Prioritize flaky tests.", "Do not touch UI files."],
+    )
+
+    updated_prompt = supervisor._consume_steering("Continue the task.")
+
+    assert "<task_update>" in updated_prompt
+    assert "Scope: next execution turn only" in updated_prompt
+    assert "- Prioritize flaky tests." in updated_prompt
+    assert "- Do not touch UI files." in updated_prompt
+    assert "Carry forward:" in updated_prompt
+    assert supervisor._run_state.pending_steering_notes == []
+
+
 def test_supervisor_rejects_target_inside_workspace_root(tmp_path: Path) -> None:
     config_path = tmp_path / "shmocky.toml"
     config_path.write_text(
         """
-[agents.engineer]
+[agents.builder]
 provider = "codex"
-role = "engineer"
+role = "builder"
 
 [agents.judge]
 provider = "oracle"
 role = "judge"
 
 [workflows.plan_execute_judge]
-planner_agent = "engineer"
-executor_agent = "engineer"
+executor_agent = "builder"
 judge_agent = "judge"
 """.strip(),
         encoding="utf-8",
@@ -151,17 +186,16 @@ def test_supervisor_rejects_non_git_target_dir(tmp_path: Path) -> None:
     config_path.parent.mkdir()
     config_path.write_text(
         """
-[agents.engineer]
+[agents.builder]
 provider = "codex"
-role = "engineer"
+role = "builder"
 
 [agents.judge]
 provider = "codex"
 role = "judge"
 
 [workflows.plan_execute_judge]
-planner_agent = "engineer"
-executor_agent = "engineer"
+executor_agent = "builder"
 judge_agent = "judge"
 """.strip(),
         encoding="utf-8",
@@ -186,17 +220,16 @@ def test_supervisor_rejects_target_nested_in_other_repo(tmp_path: Path) -> None:
     config_path.parent.mkdir()
     config_path.write_text(
         """
-[agents.engineer]
+[agents.builder]
 provider = "codex"
-role = "engineer"
+role = "builder"
 
 [agents.judge]
 provider = "oracle"
 role = "judge"
 
 [workflows.plan_execute_judge]
-planner_agent = "engineer"
-executor_agent = "engineer"
+executor_agent = "builder"
 judge_agent = "judge"
 """.strip(),
         encoding="utf-8",
@@ -238,7 +271,7 @@ def test_supervisor_lists_and_loads_persisted_run_snapshots(tmp_path: Path) -> N
                 goal="Ship the feature.",
                 status="completed",
                 phase="completed",
-                codex_agent_id="engineer",
+                codex_agent_id="builder",
                 judge_agent_id="judge",
                 started_at=started_at,
                 updated_at=started_at,
@@ -303,7 +336,7 @@ def test_supervisor_debounces_snapshot_flushes_for_bursty_updates(
         goal="Keep snapshot writes cheap.",
         status="running",
         phase="executing",
-        codex_agent_id="engineer",
+        codex_agent_id="builder",
         judge_agent_id="judge",
         started_at=started_at,
         updated_at=started_at,
@@ -353,7 +386,7 @@ def test_supervisor_snapshot_uses_archived_completed_run_when_bridge_is_gone(
         goal="Explain the run.",
         status="failed",
         phase="failed",
-        codex_agent_id="engineer",
+        codex_agent_id="builder",
         judge_agent_id="judge",
         started_at=started_at,
         updated_at=started_at,
@@ -475,7 +508,7 @@ def test_supervisor_pauses_and_resumes_after_oracle_failure(tmp_path: Path) -> N
         goal="Keep waiting for Oracle.",
         status="running",
         phase="advising",
-        codex_agent_id="engineer",
+        codex_agent_id="builder",
         expert_agent_id="expert",
         judge_agent_id="judge",
         started_at=started_at,
@@ -551,7 +584,7 @@ def test_supervisor_restores_resumable_oracle_pause_from_disk(tmp_path: Path) ->
                 goal="Keep the run resumable.",
                 status="paused",
                 phase="paused",
-                codex_agent_id="engineer",
+                codex_agent_id="builder",
                 expert_agent_id="expert",
                 judge_agent_id="judge",
                 started_at=started_at,
@@ -561,7 +594,6 @@ def test_supervisor_restores_resumable_oracle_pause_from_disk(tmp_path: Path) ->
                 judge_calls=1,
                 max_judge_calls=4,
                 max_runtime_minutes=45,
-                last_plan="Plan",
                 last_codex_output="Codex output",
                 oracle_resume_checkpoint=OracleResumeCheckpoint(
                     agent_label="expert",
@@ -642,7 +674,7 @@ def test_supervisor_resume_run_restarts_paused_oracle_run_from_manifest(tmp_path
                 goal="Keep the run resumable.",
                 status="paused",
                 phase="paused",
-                codex_agent_id="engineer",
+                codex_agent_id="builder",
                 expert_agent_id="expert",
                 judge_agent_id="judge",
                 started_at=started_at,
@@ -652,7 +684,6 @@ def test_supervisor_resume_run_restarts_paused_oracle_run_from_manifest(tmp_path
                 judge_calls=1,
                 max_judge_calls=4,
                 max_runtime_minutes=45,
-                last_plan="Plan",
                 last_codex_output="Codex output",
                 oracle_resume_checkpoint=OracleResumeCheckpoint(
                     agent_label="expert",
@@ -679,12 +710,10 @@ def test_supervisor_resume_run_restarts_paused_oracle_run_from_manifest(tmp_path
   "workflow": {
     "id": "plan_execute_judge",
     "kind": "linear_loop",
-    "planner_agent": "engineer",
-    "executor_agent": "engineer",
+    "executor_agent": "builder",
     "expert_agent": "expert",
     "judge_agent": "judge",
-    "plan_prompt_template": "Plan {goal}",
-    "execute_prompt_template": "Execute {plan}",
+    "execute_prompt_template": "Execute {goal}",
     "expert_prompt_template": "Expert {judge_bundle}",
     "judge_prompt_template": "Judge {judge_bundle}",
     "max_loops": 4,
@@ -693,9 +722,9 @@ def test_supervisor_resume_run_restarts_paused_oracle_run_from_manifest(tmp_path
   },
   "agents": {
     "codex": {
-      "id": "engineer",
+      "id": "builder",
       "provider": "codex",
-      "role": "engineer",
+      "role": "builder",
       "model": "gpt-5.3-codex-spark"
     },
     "expert": {
@@ -760,7 +789,7 @@ def test_supervisor_resume_run_restarts_paused_oracle_run_from_manifest(tmp_path
         "target_dir": str(tmp_path / "repo"),
         "resume_thread_id": "thread-9",
         "transcript_seed_count": 1,
-        "codex_role": "engineer",
+        "codex_role": "builder",
         "workflow_id": "plan_execute_judge",
         "expert_agent_id": "expert",
     }
@@ -770,17 +799,16 @@ def test_supervisor_start_run_uses_managed_worktree(tmp_path: Path) -> None:
     config_path = tmp_path / "shmocky.toml"
     config_path.write_text(
         """
-[agents.engineer]
+[agents.builder]
 provider = "codex"
-role = "engineer"
+role = "builder"
 
 [agents.judge]
 provider = "codex"
 role = "judge"
 
 [workflows.plan_execute_judge]
-planner_agent = "engineer"
-executor_agent = "engineer"
+executor_agent = "builder"
 judge_agent = "judge"
 """.strip(),
         encoding="utf-8",
@@ -847,17 +875,16 @@ def test_supervisor_rolls_back_failed_run_start(tmp_path: Path) -> None:
     config_path = tmp_path / "shmocky.toml"
     config_path.write_text(
         """
-[agents.engineer]
+[agents.builder]
 provider = "codex"
-role = "engineer"
+role = "builder"
 
 [agents.judge]
 provider = "codex"
 role = "judge"
 
 [workflows.plan_execute_judge]
-planner_agent = "engineer"
-executor_agent = "engineer"
+executor_agent = "builder"
 judge_agent = "judge"
 """.strip(),
         encoding="utf-8",

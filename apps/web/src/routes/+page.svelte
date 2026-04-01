@@ -1570,8 +1570,8 @@ onMount(() => {
 							{#if selectedWorkflow()}
 								<div class="grid gap-2 border-t border-border pt-3 text-[0.76rem] text-muted-foreground">
 									<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
-										<div>Planner</div>
-										<div class="truncate text-foreground">{selectedWorkflow()?.planner_agent}</div>
+										<div>Builder</div>
+										<div class="truncate text-foreground">{selectedWorkflow()?.executor_agent}</div>
 									</div>
 									<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 										<div>Expert</div>

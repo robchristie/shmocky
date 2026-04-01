@@ -34,7 +34,6 @@ type WorkflowRunStatus = Literal[
 ]
 type WorkflowPhase = Literal[
     "idle",
-    "planning",
     "executing",
     "advising",
     "judging",
@@ -199,11 +198,9 @@ class AgentDefinition(BaseModel):
 class WorkflowDefinition(BaseModel):
     id: str
     kind: WorkflowKind = "linear_loop"
-    planner_agent: str
     executor_agent: str
     expert_agent: str | None = None
     judge_agent: str
-    plan_prompt_template: str
     execute_prompt_template: str
     expert_prompt_template: str | None = None
     judge_prompt_template: str
@@ -292,7 +289,6 @@ class WorkflowRunState(BaseModel):
     max_judge_calls: int
     max_runtime_minutes: int
     expert_agent_id: str | None = None
-    last_plan: str | None = None
     last_codex_output: str | None = None
     last_expert_assessment: str | None = None
     last_judge_decision: WorkflowDecisionType | None = None

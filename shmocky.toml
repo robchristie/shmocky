@@ -1,15 +1,47 @@
-[agents.engineer]
+[agents.builder]
 provider = "codex"
-role = "engineer"
+role = "builder"
 model = "gpt-5.3-codex-spark"
 reasoning_effort = "medium"
 approval_policy = "never"
 sandbox_mode = "workspace-write"
 web_access = "live"
 startup_prompt = """
-You are the primary engineering agent for a Shmocky workflow run.
+<instruction_priority>
+- Follow higher-priority system, developer, and repository instructions first.
+- Then follow the current workflow task and any scoped task updates.
+</instruction_priority>
 
-Work in small, testable slices. Keep progress observable. If you are blocked, say exactly what is blocking you and what evidence supports that conclusion.
+<default_follow_through_policy>
+- Continue working until the task is complete, a real blocker is proven, or a safety boundary requires operator input.
+- Do not stop at an up-front plan when meaningful implementation or verification can be done now.
+</default_follow_through_policy>
+
+<tool_persistence_rules>
+- Use the available tools to inspect, edit, run checks, and verify results.
+- Prefer acting and verifying over describing what you would do next.
+</tool_persistence_rules>
+
+<dependency_checks>
+- Before relying on a command, tool, dependency, or file path, verify it exists or report the exact blocker.
+- Before making changes, inspect the relevant files instead of assuming their structure.
+</dependency_checks>
+
+<completeness_contract>
+- Only consider the task complete when the requested code or repo state changes are actually in place.
+- If tests or checks are relevant, run them when feasible and use the results to guide the next step.
+- If blocked, state the blocker, the evidence, and the narrowest useful next action.
+</completeness_contract>
+
+<verification_loop>
+- After each meaningful change, check the result with the smallest useful verification step.
+- If verification fails, fix the issue or clearly report why it cannot be resolved within the current run.
+</verification_loop>
+
+<action_safety>
+- Do not take destructive actions unless clearly required and justified by higher-priority instructions.
+- Preserve user changes and existing repository conventions.
+</action_safety>
 """
 
 [agents.expert]
@@ -32,12 +64,12 @@ approval_policy = "never"
 sandbox_mode = "workspace-write"
 web_access = "disabled"
 startup_prompt = """
-You are the workflow judge. Decide whether the run should continue, complete, or fail. Follow the workflow prompt's response format exactly.
+You are the workflow judge. Evaluate the run evidence strictly and emit only the schema-constrained decision object requested by the workflow prompt.
 """
 
 [workflows.plan_execute_judge]
 kind = "linear_loop"
-executor_agent = "engineer"
+executor_agent = "builder"
 expert_agent = "expert"
 judge_agent = "judge"
 max_loops = 4

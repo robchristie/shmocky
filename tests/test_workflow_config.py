@@ -12,9 +12,9 @@ def test_workflow_config_loader_reads_repo_toml(tmp_path: Path) -> None:
     config_path = tmp_path / "shmocky.toml"
     config_path.write_text(
         """
-[agents.engineer]
+[agents.builder]
 provider = "codex"
-role = "engineer"
+role = "builder"
 model = "gpt-5.4"
 reasoning_effort = "high"
 approval_policy = "never"
@@ -34,8 +34,7 @@ role = "judge"
 model = "gpt-5.4"
 
 [workflows.plan_execute_judge]
-planner_agent = "engineer"
-executor_agent = "engineer"
+executor_agent = "builder"
 expert_agent = "expert"
 judge_agent = "judge"
 max_loops = 3
@@ -54,7 +53,7 @@ max_judge_calls = 3
     catalog = WorkflowConfigLoader(settings).load()
 
     assert catalog.loaded is True
-    assert [agent.id for agent in catalog.agents] == ["engineer", "expert", "judge"]
+    assert [agent.id for agent in catalog.agents] == ["builder", "expert", "judge"]
     assert [workflow.id for workflow in catalog.workflows] == ["plan_execute_judge"]
     assert catalog.agents[1].prompt_char_limit == 64_000
     assert (
@@ -62,7 +61,6 @@ max_judge_calls = 3
         == "https://chatgpt.com/g/g-p-69cc59b46ad08191886f589993476e6f-codex/project"
     )
     assert catalog.workflows[0].expert_agent == "expert"
-    assert catalog.workflows[0].plan_prompt_template
     assert catalog.workflows[0].judge_prompt_template
 
 
@@ -70,21 +68,12 @@ def test_workflow_config_loader_rejects_split_codex_agents(tmp_path: Path) -> No
     config_path = tmp_path / "shmocky.toml"
     config_path.write_text(
         """
-[agents.planner]
-provider = "codex"
-role = "planner"
-
-[agents.executor]
-provider = "codex"
-role = "engineer"
-
 [agents.judge]
 provider = "codex"
 role = "judge"
 
 [workflows.plan_execute_judge]
-planner_agent = "planner"
-executor_agent = "executor"
+executor_agent = "builder"
 judge_agent = "judge"
 """.strip(),
         encoding="utf-8",
@@ -96,7 +85,7 @@ judge_agent = "judge"
         oracle_cli_command="true",
     )
 
-    with pytest.raises(WorkflowConfigError):
+    with pytest.raises(WorkflowConfigError, match="unknown agent 'builder'"):
         WorkflowConfigLoader(settings).load()
 
 
@@ -104,17 +93,16 @@ def test_workflow_config_loader_rejects_oracle_judge(tmp_path: Path) -> None:
     config_path = tmp_path / "shmocky.toml"
     config_path.write_text(
         """
-[agents.engineer]
+[agents.builder]
 provider = "codex"
-role = "engineer"
+role = "builder"
 
 [agents.judge]
 provider = "oracle"
 role = "judge"
 
 [workflows.plan_execute_judge]
-planner_agent = "engineer"
-executor_agent = "engineer"
+executor_agent = "builder"
 judge_agent = "judge"
 """.strip(),
         encoding="utf-8",

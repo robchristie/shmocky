@@ -83,7 +83,7 @@ The current workflow shape is intentionally narrow:
 
 - repo-local TOML config
 - one active run at a time
-- one Codex planner or executor thread per run
+- one Codex builder thread per run
 - one optional expert advisory hop plus a Codex judge that decides whether to continue
 - workflow `target_dir` means the source git repository root
 - Shmocky creates a managed worktree under `.shmocky/worktrees/<run-id>` and runs Codex there

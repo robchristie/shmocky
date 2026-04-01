@@ -136,3 +136,48 @@ def test_bridge_wait_for_turn_completion_fails_fast_on_process_exit(tmp_path: Pa
             await task
 
     asyncio.run(exercise())
+
+
+def test_bridge_start_turn_forwards_output_schema(tmp_path: Path) -> None:
+    bridge = CodexAppServerBridge(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+    bridge._projection.apply_response(
+        "thread/start",
+        {
+            "thread": {
+                "id": "thread-1",
+                "status": {"type": "idle"},
+            }
+        },
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_call(method: str, params: dict[str, object]) -> dict[str, object]:
+        captured["method"] = method
+        captured["params"] = params
+        return {}
+
+    setattr(bridge, "_call", fake_call)
+
+    async def exercise() -> None:
+        await bridge.start_turn(
+            "Return a decision",
+            output_schema={"type": "object", "properties": {"decision": {"type": "string"}}},
+        )
+
+    asyncio.run(exercise())
+
+    assert captured["method"] == "turn/start"
+    assert captured["params"] == {
+        "threadId": "thread-1",
+        "input": [{"type": "text", "text": "Return a decision"}],
+        "outputSchema": {
+            "type": "object",
+            "properties": {"decision": {"type": "string"}},
+        },
+    }

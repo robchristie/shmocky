@@ -766,25 +766,21 @@ class WorkflowSupervisor:
         judge_agent: Any,
     ) -> None:
         try:
-            await self._ensure_checkpoint("planning", "Planning with Codex.")
-            plan_prompt = self._render_template(
-                workflow.plan_prompt_template,
-                goal=self._run_state.goal if self._run_state else "",
-            )
-            plan_output = await self._run_codex_turn(plan_prompt, kind="planning")
             if self._run_state is None:
-                raise WorkflowSupervisorError("Workflow run disappeared during planning.")
-            self._run_state.last_plan = self._clip(plan_output)
-            initial_execute_prompt = self._render_template(
+                raise WorkflowSupervisorError("No workflow run exists.")
+            initial_execute_prompt = self._render_agent_prompt(
                 workflow.execute_prompt_template,
+                agent=codex_agent,
                 goal=self._run_state.goal,
-                plan=plan_output,
+                last_output="",
+                judge_bundle="",
+                expert_assessment="",
             )
             await self._execute_remaining_loops(
                 workflow,
-                plan_output,
                 initial_execute_prompt,
                 start_loop=1,
+                builder_agent=codex_agent,
                 expert_agent=expert_agent,
                 judge_agent=judge_agent,
             )
@@ -811,7 +807,6 @@ class WorkflowSupervisor:
                     "Cannot resume Oracle-blocked run without preserved Codex output."
                 )
             loop_index = checkpoint.loop_index
-            plan_output = self._run_state.last_plan or ""
             codex_output = self._run_state.last_codex_output
             expert_assessment = self._run_state.last_expert_assessment
 
@@ -857,7 +852,6 @@ class WorkflowSupervisor:
                     context.workflow.judge_prompt_template,
                     agent=context.judge_agent,
                     goal=self._run_state.goal or "",
-                    plan=plan_output,
                     last_output=codex_output,
                     judge_bundle=judge_bundle,
                     expert_assessment=expert_assessment or "",
@@ -891,9 +885,9 @@ class WorkflowSupervisor:
                 return
             await self._execute_remaining_loops(
                 context.workflow,
-                plan_output,
                 next_prompt,
                 start_loop=loop_index + 1,
+                builder_agent=context.codex_agent,
                 expert_agent=context.expert_agent,
                 judge_agent=context.judge_agent,
             )
@@ -911,10 +905,10 @@ class WorkflowSupervisor:
     async def _execute_remaining_loops(
         self,
         workflow: Any,
-        plan_output: str,
         execute_prompt: str,
         *,
         start_loop: int,
+        builder_agent: Any,
         expert_agent: Any,
         judge_agent: Any,
     ) -> None:
@@ -948,7 +942,6 @@ class WorkflowSupervisor:
                     workflow.expert_prompt_template,
                     agent=expert_agent,
                     goal=self._run_state.goal or "",
-                    plan=plan_output,
                     last_output=codex_output,
                     judge_bundle=expert_bundle,
                     expert_assessment="",
@@ -986,7 +979,6 @@ class WorkflowSupervisor:
                 workflow.judge_prompt_template,
                 agent=judge_agent,
                 goal=self._run_state.goal or "",
-                plan=plan_output,
                 last_output=codex_output,
                 judge_bundle=judge_bundle,
                 expert_assessment=expert_assessment or "",
@@ -1043,7 +1035,13 @@ class WorkflowSupervisor:
             )
         return decision.next_prompt
 
-    async def _run_codex_turn(self, prompt: str, *, kind: str) -> str:
+    async def _run_codex_turn(
+        self,
+        prompt: str,
+        *,
+        kind: str,
+        output_schema: dict[str, Any] | None = None,
+    ) -> str:
         if self._bridge is None:
             raise WorkflowSupervisorError("Codex session is not available.")
         await self._record_workflow_event(
@@ -1051,7 +1049,7 @@ class WorkflowSupervisor:
             f"Started Codex {kind} turn.",
             payload={"prompt": self._clip(prompt, limit=2_000)},
         )
-        snapshot = await self._bridge.start_turn(prompt)
+        snapshot = await self._bridge.start_turn(prompt, output_schema=output_schema)
         turn = snapshot.state.turn
         if turn is None:
             raise WorkflowSupervisorError("Codex did not create a turn.")
@@ -1155,6 +1153,7 @@ class WorkflowSupervisor:
                 prompt,
                 event_log_subdir="judge-codex-events",
                 label="judge",
+                output_schema=self._judge_output_schema(),
             )
             response_payload = {
                 "answer": raw_answer,
@@ -1369,7 +1368,6 @@ class WorkflowSupervisor:
             "loop": self._run_state.current_loop,
             "judgeCalls": self._run_state.judge_calls,
             "recentSteeringNotes": self._run_state.recent_steering_notes[-5:],
-            "lastPlan": self._run_state.last_plan,
             "lastCodexOutput": self._clip(codex_output, limit=8_000),
             "expertAssessment": self._clip(expert_assessment, limit=8_000),
             "codexLastError": (
@@ -1395,6 +1393,7 @@ class WorkflowSupervisor:
         *,
         event_log_subdir: str,
         label: str,
+        output_schema: dict[str, Any] | None = None,
     ) -> str:
         if self._run_state is None:
             raise WorkflowSupervisorError("No workflow run exists.")
@@ -1419,7 +1418,7 @@ class WorkflowSupervisor:
         )
         await bridge.start()
         try:
-            snapshot = await bridge.start_turn(prompt)
+            snapshot = await bridge.start_turn(prompt, output_schema=output_schema)
             turn = snapshot.state.turn
             if turn is None:
                 raise WorkflowSupervisorError(f"Codex {label} did not create a turn.")
@@ -1469,10 +1468,18 @@ class WorkflowSupervisor:
             return prompt
         notes_block = "\n".join(f"- {note}" for note in notes)
         return (
-            f"{prompt}\n\nOperator steering to apply on this step:\n"
-            f"{notes_block}\n\n"
-            "Follow this steering unless it directly conflicts with higher-priority instructions."
+            f"{prompt}\n\n<task_update>\n"
+            "Scope: next execution turn only\n"
+            "Override:\n"
+            f"{notes_block}\n"
+            "Carry forward:\n"
+            "- All earlier run instructions still apply unless they conflict with the override above.\n"
+            "</task_update>"
         )
+
+    @staticmethod
+    def _judge_output_schema() -> dict[str, Any]:
+        return JudgeDecision.model_json_schema()
 
     @staticmethod
     def _assistant_text_for_turn(snapshot: DashboardSnapshot, turn_id: str) -> str:
