@@ -78,6 +78,7 @@ class LoadedRunContext:
 class WorkflowSupervisor:
     RUN_MANIFEST_FILENAME = "run.json"
     RUN_SNAPSHOT_FILENAME = "dashboard-snapshot.json"
+    SNAPSHOT_FLUSH_DEBOUNCE_SECONDS = 0.25
 
     def __init__(self, settings: AppSettings) -> None:
         self._settings = settings
@@ -93,6 +94,13 @@ class WorkflowSupervisor:
         self._bridge_queue: asyncio.Queue[StreamEnvelope] | None = None
         self._resources: RunResources | None = None
         self._archived_snapshot: DashboardSnapshot | None = None
+        self._snapshot_flush_task: asyncio.Task[None] | None = None
+        self._snapshot_flush_lock = asyncio.Lock()
+        self._staged_snapshot: DashboardSnapshot | None = None
+        self._staged_snapshot_path: Path | None = None
+        self._staged_snapshot_revision = 0
+        self._snapshot_revision = 0
+        self._snapshot_flushed_revision = 0
         self._pause_gate = asyncio.Event()
         self._pause_gate.set()
         self._last_catalog_error: str | None = None
@@ -345,7 +353,8 @@ class WorkflowSupervisor:
                 and self._run_state.status == "paused"
                 and self._run_state.oracle_resume_checkpoint is not None
             ):
-                self._persist_run_snapshot()
+                self._stage_run_snapshot()
+            await self._flush_staged_snapshot_now()
 
     async def start_thread(self) -> DashboardSnapshot:
         if self._bridge is None:
@@ -457,7 +466,8 @@ class WorkflowSupervisor:
                     },
                 },
             )
-            self._persist_run_snapshot()
+            self._stage_run_snapshot()
+            await self._flush_staged_snapshot_now()
             try:
                 await self._record_workflow_event(
                     "run_started",
@@ -490,9 +500,15 @@ class WorkflowSupervisor:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._run_task
             self._run_task = None
+        await self._cancel_snapshot_flush_task()
         self._run_state = None
         self._resources = None
         self._archived_snapshot = None
+        self._staged_snapshot = None
+        self._staged_snapshot_path = None
+        self._staged_snapshot_revision = 0
+        self._snapshot_revision = 0
+        self._snapshot_flushed_revision = 0
         self._recent_workflow_events.clear()
         self._pause_gate.set()
 
@@ -667,7 +683,7 @@ class WorkflowSupervisor:
                 envelope = await queue.get()
                 if envelope.type != "event" or envelope.event is None:
                     continue
-                self._persist_run_snapshot()
+                self._stage_run_snapshot()
                 await self._broadcast(
                     StreamEnvelope(
                         type="event",
@@ -1171,6 +1187,7 @@ class WorkflowSupervisor:
             },
         )
         await self._broadcast_state()
+        await self._flush_staged_snapshot_now()
         await self._pause_gate.wait()
         if self._run_state.stop_requested:
             raise WorkflowStoppedError("Workflow stop requested.")
@@ -1190,6 +1207,7 @@ class WorkflowSupervisor:
                 "Workflow run paused between steps.",
             )
             await self._broadcast_state()
+            await self._flush_staged_snapshot_now()
             await self._pause_gate.wait()
         if self._run_state.stop_requested:
             raise WorkflowStoppedError("Workflow stop requested.")
@@ -1218,6 +1236,7 @@ class WorkflowSupervisor:
             )
         await self._stop_bridge()
         await self._broadcast_state()
+        await self._flush_staged_snapshot_now()
 
     async def _record_workflow_event(
         self,
@@ -1236,7 +1255,7 @@ class WorkflowSupervisor:
         self._recent_workflow_events.append(record)
         if self._run_state is not None:
             self._run_state.updated_at = datetime.now(UTC)
-        self._persist_run_snapshot()
+        self._stage_run_snapshot()
         await self._broadcast(
             StreamEnvelope(
                 type="workflow_event",
@@ -1247,7 +1266,7 @@ class WorkflowSupervisor:
         )
 
     async def _broadcast_state(self) -> None:
-        self._persist_run_snapshot()
+        self._stage_run_snapshot()
         await self._broadcast(
             StreamEnvelope(
                 type="state",
@@ -1630,17 +1649,68 @@ class WorkflowSupervisor:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
-    def _persist_run_snapshot(self) -> None:
+    def _stage_run_snapshot(self) -> None:
         if self._resources is None:
             return
         snapshot = self.snapshot()
         snapshot_path = self._resources.run_dir / self.RUN_SNAPSHOT_FILENAME
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        snapshot_path.write_text(
-            snapshot.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
         self._archived_snapshot = snapshot.model_copy(deep=True)
+        self._staged_snapshot = snapshot
+        self._staged_snapshot_path = snapshot_path
+        self._snapshot_revision += 1
+        self._staged_snapshot_revision = self._snapshot_revision
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._write_snapshot_file(snapshot_path, snapshot.model_dump_json(indent=2))
+            self._snapshot_flushed_revision = self._staged_snapshot_revision
+            return
+        if self._snapshot_flush_task is None or self._snapshot_flush_task.done():
+            self._snapshot_flush_task = asyncio.create_task(self._flush_staged_snapshot_loop())
+
+    async def _flush_staged_snapshot_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.SNAPSHOT_FLUSH_DEBOUNCE_SECONDS)
+                await self._flush_staged_snapshot_to_disk()
+                if self._snapshot_flushed_revision >= self._snapshot_revision:
+                    return
+        except asyncio.CancelledError:
+            return
+        finally:
+            current = asyncio.current_task()
+            if self._snapshot_flush_task is current:
+                self._snapshot_flush_task = None
+
+    async def _flush_staged_snapshot_now(self) -> None:
+        await self._cancel_snapshot_flush_task()
+        await self._flush_staged_snapshot_to_disk()
+
+    async def _cancel_snapshot_flush_task(self) -> None:
+        task = self._snapshot_flush_task
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        self._snapshot_flush_task = None
+
+    async def _flush_staged_snapshot_to_disk(self) -> None:
+        async with self._snapshot_flush_lock:
+            snapshot = self._staged_snapshot
+            snapshot_path = self._staged_snapshot_path
+            revision = self._staged_snapshot_revision
+            if snapshot is None or snapshot_path is None:
+                return
+            payload = snapshot.model_dump_json(indent=2)
+            await asyncio.to_thread(self._write_snapshot_file, snapshot_path, payload)
+            if revision > self._snapshot_flushed_revision:
+                self._snapshot_flushed_revision = revision
+
+    @staticmethod
+    def _write_snapshot_file(path: Path, payload: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(payload, encoding="utf-8")
 
 
 def as_http_error(error: Exception) -> HTTPException:

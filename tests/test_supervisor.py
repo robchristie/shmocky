@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 
 from shmocky.bridge import BridgeError, CodexAppServerBridge
+from shmocky.event_store import WorkflowEventStore
 from shmocky.models import (
     ConnectionState,
     DashboardSnapshot,
@@ -23,7 +24,7 @@ from shmocky.models import (
     WorkflowRunState,
 )
 from shmocky.settings import AppSettings
-from shmocky.supervisor import LoadedRunContext, WorkflowSupervisor, WorkflowSupervisorError
+from shmocky.supervisor import LoadedRunContext, RunResources, WorkflowSupervisor, WorkflowSupervisorError
 
 
 def test_supervisor_extract_json_from_fenced_answer() -> None:
@@ -224,6 +225,64 @@ def test_supervisor_lists_and_loads_persisted_run_snapshots(tmp_path: Path) -> N
     assert history.runs[0].last_judge_summary == "Done."
     assert loaded.state.workflow_run is not None
     assert loaded.state.workflow_run.status == "completed"
+
+
+def test_supervisor_debounces_snapshot_flushes_for_bursty_updates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / ".shmocky" / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    started_at = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            run_log_dir=tmp_path / ".shmocky" / "runs",
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+    supervisor._resources = RunResources(
+        run_dir=run_dir,
+        workflow_event_store=WorkflowEventStore(run_dir / "workflow-events.jsonl"),
+    )
+    supervisor._run_state = WorkflowRunState(
+        id="run-1",
+        run_name="burst test",
+        workflow_id="plan_execute_judge",
+        target_dir=str(tmp_path / "repo"),
+        goal="Keep snapshot writes cheap.",
+        status="running",
+        phase="executing",
+        codex_agent_id="engineer",
+        judge_agent_id="judge",
+        started_at=started_at,
+        updated_at=started_at,
+        max_loops=4,
+        max_judge_calls=4,
+        max_runtime_minutes=45,
+    )
+
+    writes: list[Path] = []
+
+    def fake_write_snapshot_file(path: Path, payload: str) -> None:
+        writes.append(path)
+
+    monkeypatch.setattr(
+        WorkflowSupervisor,
+        "_write_snapshot_file",
+        staticmethod(fake_write_snapshot_file),
+    )
+
+    async def exercise() -> None:
+        supervisor._stage_run_snapshot()
+        supervisor._stage_run_snapshot()
+        supervisor._stage_run_snapshot()
+        await asyncio.sleep(supervisor.SNAPSHOT_FLUSH_DEBOUNCE_SECONDS * 3)
+
+    asyncio.run(exercise())
+
+    assert writes == [run_dir / WorkflowSupervisor.RUN_SNAPSHOT_FILENAME]
 
 
 def test_supervisor_snapshot_uses_archived_completed_run_when_bridge_is_gone(
