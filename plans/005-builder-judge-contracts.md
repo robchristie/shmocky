@@ -12,7 +12,7 @@ This ships in two slices:
 1. `builder` + typed `judge` + `<task_update>` steering
 2. optional semistructured `expert` output + optional typed `router`
 
-This change implements slice 1 and leaves slice 2 explicitly deferred.
+This change now implements both slices.
 
 ## Scope
 
@@ -29,9 +29,7 @@ In scope:
 
 Out of scope:
 
-- typed router execution
-- semistructured expert schema parsing
-- new artifact models beyond the existing `JudgeDecision`
+- new artifact models beyond the routing and expert-assessment contracts added here
 - replacing Oracle or adding paid API sidecars
 
 ## Architecture
@@ -51,7 +49,9 @@ Backend:
 Frontend:
 
 - workflow summaries label the main coding agent as `Builder`
-- operator text and transcript behavior remain otherwise unchanged in slice 1
+- transcript extras surface router decisions and expert assessments as first-class operator-visible
+  outputs
+- workflow config summaries can show the optional `Router`
 
 ## Milestones
 
@@ -67,6 +67,10 @@ Frontend:
 4. Validation
    - update config, supervisor, and bridge tests
    - run backend and frontend quality gates
+5. Slice 2 additions
+   - add optional typed router selection before the long-lived builder thread starts
+   - parse expert output into a semistructured advisory artifact with tolerant fallback for Oracle
+   - persist routed agent selections and expert artifacts into run snapshots and manifests
 
 ## Validation
 
@@ -78,10 +82,8 @@ Frontend:
 
 ## Open Questions
 
-- whether the optional `expert` slice should use labeled text sections or a looser Pydantic-backed
-  parser for semistructured advisory output
-- whether the `router` should be enabled by default only once there are enough workflow choices to
-  justify the extra decision step
+- whether the router should eventually be able to select between whole workflows rather than only
+  choosing from per-workflow agent option lists
 
 ## Progress Notes
 
@@ -93,5 +95,9 @@ Frontend:
   contracts, and workflow steering now renders as a scoped `<task_update>` block.
 - 2026-04-01: Codex judge turns now use app-server `turn/start.outputSchema` with the
   `JudgeDecision` schema, keeping control-plane output typed while staying on the Codex app path.
-- 2026-04-01: Slice 2 remains deferred. Expert semistructured output and an optional typed router
-  are not implemented in this change.
+- 2026-04-01: Shipped slice 2. Workflows can now opt into a typed Codex router turn that chooses
+  from explicit per-workflow agent whitelists before the builder thread starts, and expert output
+  is now reduced into a semistructured `ExpertAssessment` artifact.
+- 2026-04-01: Oracle expert output remains tolerant. Shmocky prefers structured JSON or labeled
+  sections but will degrade to a summary-only expert artifact rather than failing the run when the
+  browser model returns plain text.

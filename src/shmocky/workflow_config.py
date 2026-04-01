@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import ValidationError
 
@@ -21,15 +21,39 @@ Constraints:
 - Verify meaningful changes before concluding.
 </builder_task>"""
 
-DEFAULT_EXPERT_PROMPT_TEMPLATE = """You are the workflow expert advisor. Review the run context below
-and return plain text only.
+DEFAULT_ROUTER_PROMPT_TEMPLATE = """<router_task>
+Select the best allowed agent composition for this run.
+
+Requirements:
+- Choose only from the provided workflow id and allowed agent ids.
+- Prefer skipping the expert hop unless it is likely to add clear value.
+- Keep the decision grounded in the goal, repo context, and candidate agent descriptions.
+- Do not emit prose outside the constrained response.
+</router_task>
+
+Context:
+{routing_bundle}"""
+
+DEFAULT_EXPERT_PROMPT_TEMPLATE = """<expert_task>
+You are the workflow expert advisor. Review the run context below and return either:
+- a JSON object matching the requested structure, or
+- labeled sections using exactly:
+  Summary:
+  Risks:
+  Missed opportunities:
+  Suggested checks:
+  Recommended next prompt:
 
 Your job:
 - assess the current run state and the latest Codex work
 - identify the most important risks, missed opportunities, or next experiments
 - suggest what the judge should consider before deciding whether to continue
 
-Keep the response concise but specific. Free text is fine.
+Requirements:
+- Keep the response concise but specific.
+- Use bullet lists for multi-item sections.
+- Use an empty section rather than inventing content.
+</expert_task>
 
 Context:
 {judge_bundle}"""
@@ -115,12 +139,26 @@ class WorkflowConfigLoader:
         for workflow_id, raw_workflow in payload.items():
             if not isinstance(workflow_id, str) or not isinstance(raw_workflow, dict):
                 raise WorkflowConfigError("Each workflow entry must be a TOML table.")
+            normalized_workflow = cast(dict[str, Any], raw_workflow)
+            default_executor = normalized_workflow.get("executor_agent")
+            default_judge = normalized_workflow.get("judge_agent")
+            default_expert = normalized_workflow.get("expert_agent")
             workflow_payload = {
                 "id": workflow_id,
+                "router_prompt_template": DEFAULT_ROUTER_PROMPT_TEMPLATE,
                 "execute_prompt_template": DEFAULT_EXECUTE_PROMPT_TEMPLATE,
                 "expert_prompt_template": DEFAULT_EXPERT_PROMPT_TEMPLATE,
                 "judge_prompt_template": DEFAULT_JUDGE_PROMPT_TEMPLATE,
-                **raw_workflow,
+                "router_executor_options": (
+                    [default_executor] if isinstance(default_executor, str) else []
+                ),
+                "router_judge_options": (
+                    [default_judge] if isinstance(default_judge, str) else []
+                ),
+                "router_expert_options": (
+                    [default_expert] if isinstance(default_expert, str) else []
+                ),
+                **normalized_workflow,
             }
             try:
                 workflow = WorkflowDefinition.model_validate(workflow_payload)
@@ -135,11 +173,20 @@ class WorkflowConfigLoader:
                 raise WorkflowConfigError(
                     f"Workflow '{workflow_id}' references unknown agent '{workflow.expert_agent}'."
                 )
+            if workflow.router_agent is not None and workflow.router_agent not in agent_by_id:
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow_id}' references unknown agent '{workflow.router_agent}'."
+                )
             executor = agent_by_id[workflow.executor_agent]
             judge = agent_by_id[workflow.judge_agent]
             expert = (
                 agent_by_id[workflow.expert_agent]
                 if workflow.expert_agent is not None
+                else None
+            )
+            router = (
+                agent_by_id[workflow.router_agent]
+                if workflow.router_agent is not None
                 else None
             )
             if executor.provider != "codex":
@@ -154,6 +201,11 @@ class WorkflowConfigLoader:
                 raise WorkflowConfigError(
                     f"Workflow '{workflow_id}' uses unsupported expert provider '{expert.provider}'."
                 )
+            if router is not None and router.provider != "codex":
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow_id}' must use a Codex agent for routing."
+                )
+            self._validate_router_options(workflow, agent_by_id)
             workflows.append(workflow)
         if not workflows:
             raise WorkflowConfigError("Workflow config must define at least one workflow.")
@@ -192,3 +244,49 @@ class WorkflowConfigLoader:
                 f"Agent '{agent.id}' uses unsupported options for provider '{agent.provider}': "
                 + ", ".join(unknown_keys)
             )
+
+    @staticmethod
+    def _validate_router_options(
+        workflow: WorkflowDefinition,
+        agent_by_id: dict[str, AgentDefinition],
+    ) -> None:
+        if workflow.router_agent is None:
+            return
+        if not workflow.router_executor_options:
+            raise WorkflowConfigError(
+                f"Workflow '{workflow.id}' must define at least one router executor option."
+            )
+        if not workflow.router_judge_options:
+            raise WorkflowConfigError(
+                f"Workflow '{workflow.id}' must define at least one router judge option."
+            )
+        for agent_id in workflow.router_executor_options:
+            agent = agent_by_id.get(agent_id)
+            if agent is None:
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow.id}' references unknown router executor '{agent_id}'."
+                )
+            if agent.provider != "codex":
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow.id}' router executor '{agent_id}' must be Codex."
+                )
+        for agent_id in workflow.router_judge_options:
+            agent = agent_by_id.get(agent_id)
+            if agent is None:
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow.id}' references unknown router judge '{agent_id}'."
+                )
+            if agent.provider != "codex":
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow.id}' router judge '{agent_id}' must be Codex."
+                )
+        for agent_id in workflow.router_expert_options:
+            agent = agent_by_id.get(agent_id)
+            if agent is None:
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow.id}' references unknown router expert '{agent_id}'."
+                )
+            if agent.provider not in {"codex", "oracle"}:
+                raise WorkflowConfigError(
+                    f"Workflow '{workflow.id}' router expert '{agent_id}' uses unsupported provider '{agent.provider}'."
+                )

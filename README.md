@@ -83,16 +83,36 @@ The current workflow shape is intentionally narrow:
 
 - repo-local TOML config
 - one active run at a time
+- one optional Codex router turn before execution that can choose from per-workflow agent options
 - one Codex builder thread per run
 - one optional expert advisory hop plus a Codex judge that decides whether to continue
 - workflow `target_dir` means the source git repository root
 - Shmocky creates a managed worktree under `.shmocky/worktrees/<run-id>` and runs Codex there
 - source repos must be external git repository roots, not nested subdirectories inside another repo
 
+The default control split is now:
+
+- `router`: optional typed Codex control-plane turn that chooses builder/judge/expert ids from a bounded whitelist
+- `builder`: the main long-lived Codex execution thread
+- `expert`: optional Oracle or Codex advisory turn that returns a semistructured assessment
+- `judge`: typed Codex control-plane turn that returns `continue`, `complete`, or `fail`
+
+Operator steering is rendered into the next builder turn as a scoped `<task_update>` block instead
+of a loose appended paragraph, and Codex judge turns use app-server `turn/start.outputSchema`
+instead of prose scraping.
+
 Oracle agent definitions can also carry role-specific sidecar settings such as `remote_host`,
 `chatgpt_url`, `timeout_seconds`, `model_strategy`, and `prompt_char_limit`, so different judge or
 analyst roles can run with different budgets and dedicated ChatGPT project folders from the same
 `shmocky.toml`.
+
+Expert assessments are stored both as transcript-readable text and as a typed internal artifact with:
+
+- `summary`
+- `risks[]`
+- `missed_opportunities[]`
+- `suggested_checks[]`
+- `recommended_next_prompt`
 
 If you switch Oracle’s browser model to slower modes such as ChatGPT Pro, raise or keep
 `timeout_seconds` accordingly. The default backend fallback is now `3600` seconds, and Oracle-agent

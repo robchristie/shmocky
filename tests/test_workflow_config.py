@@ -116,3 +116,50 @@ judge_agent = "judge"
 
     with pytest.raises(WorkflowConfigError, match="Codex agent for judging"):
         WorkflowConfigLoader(settings).load()
+
+
+def test_workflow_config_loader_validates_optional_router(tmp_path: Path) -> None:
+    config_path = tmp_path / "shmocky.toml"
+    config_path.write_text(
+        """
+[agents.router]
+provider = "codex"
+role = "router"
+
+[agents.builder]
+provider = "codex"
+role = "builder"
+
+[agents.expert]
+provider = "oracle"
+role = "expert"
+
+[agents.judge]
+provider = "codex"
+role = "judge"
+
+[workflows.plan_execute_judge]
+router_agent = "router"
+executor_agent = "builder"
+expert_agent = "expert"
+judge_agent = "judge"
+router_executor_options = ["builder"]
+router_judge_options = ["judge"]
+router_expert_options = ["expert"]
+""".strip(),
+        encoding="utf-8",
+    )
+    settings = AppSettings(
+        workspace_root=tmp_path,
+        workflow_config_path=config_path,
+        codex_command="true",
+        oracle_cli_command="true",
+    )
+
+    catalog = WorkflowConfigLoader(settings).load()
+
+    workflow = catalog.workflows[0]
+    assert workflow.router_agent == "router"
+    assert workflow.router_executor_options == ["builder"]
+    assert workflow.router_judge_options == ["judge"]
+    assert workflow.router_expert_options == ["expert"]

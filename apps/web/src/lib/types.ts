@@ -112,12 +112,17 @@ export interface AgentDefinition {
 export interface WorkflowDefinition {
 	id: string;
 	kind: "linear_loop";
+	router_agent: string | null;
 	executor_agent: string;
 	expert_agent: string | null;
 	judge_agent: string;
+	router_prompt_template: string | null;
 	execute_prompt_template: string;
 	expert_prompt_template: string | null;
 	judge_prompt_template: string;
+	router_executor_options: string[];
+	router_judge_options: string[];
+	router_expert_options: string[];
 	max_loops: number;
 	max_runtime_minutes: number;
 	max_judge_calls: number;
@@ -141,6 +146,22 @@ export interface OracleResumeCheckpoint {
 	noted_at: string;
 }
 
+export interface RunRoutingDecision {
+	workflow_id: string;
+	executor_agent_id: string;
+	judge_agent_id: string;
+	expert_agent_id: string | null;
+	summary: string;
+}
+
+export interface ExpertAssessment {
+	summary: string;
+	risks: string[];
+	missed_opportunities: string[];
+	suggested_checks: string[];
+	recommended_next_prompt: string | null;
+}
+
 export interface RunHistoryEntry {
 	id: string;
 	run_name: string | null;
@@ -157,6 +178,7 @@ export interface RunHistoryEntry {
 		| "stopped";
 	phase:
 		| "idle"
+		| "routing"
 		| "executing"
 		| "advising"
 		| "judging"
@@ -196,6 +218,7 @@ export interface WorkflowRunState {
 		| "stopped";
 	phase:
 		| "idle"
+		| "routing"
 		| "executing"
 		| "advising"
 		| "judging"
@@ -204,6 +227,7 @@ export interface WorkflowRunState {
 		| "failed"
 		| "stopped";
 	codex_agent_id: string;
+	router_agent_id: string | null;
 	judge_agent_id: string;
 	started_at: string;
 	updated_at: string;
@@ -214,8 +238,10 @@ export interface WorkflowRunState {
 	max_judge_calls: number;
 	max_runtime_minutes: number;
 	expert_agent_id: string | null;
+	last_routing_decision: RunRoutingDecision | null;
 	last_codex_output: string | null;
 	last_expert_assessment: string | null;
+	last_expert_report: ExpertAssessment | null;
 	last_judge_decision: "continue" | "complete" | "fail" | null;
 	last_judge_summary: string | null;
 	last_continuation_prompt: string | null;

@@ -34,6 +34,7 @@ type WorkflowRunStatus = Literal[
 ]
 type WorkflowPhase = Literal[
     "idle",
+    "routing",
     "executing",
     "advising",
     "judging",
@@ -198,12 +199,17 @@ class AgentDefinition(BaseModel):
 class WorkflowDefinition(BaseModel):
     id: str
     kind: WorkflowKind = "linear_loop"
+    router_agent: str | None = None
     executor_agent: str
     expert_agent: str | None = None
     judge_agent: str
+    router_prompt_template: str | None = None
     execute_prompt_template: str
     expert_prompt_template: str | None = None
     judge_prompt_template: str
+    router_executor_options: list[str] = Field(default_factory=list)
+    router_judge_options: list[str] = Field(default_factory=list)
+    router_expert_options: list[str] = Field(default_factory=list)
     max_loops: int = Field(default=4, ge=1, le=100)
     max_runtime_minutes: int = Field(default=30, ge=1, le=24 * 60)
     max_judge_calls: int = Field(default=4, ge=1, le=100)
@@ -258,6 +264,22 @@ class WorkflowSteerRequest(BaseModel):
     note: str = Field(min_length=1, max_length=8_000)
 
 
+class RunRoutingDecision(BaseModel):
+    workflow_id: str = Field(min_length=1, max_length=200)
+    executor_agent_id: str = Field(min_length=1, max_length=200)
+    judge_agent_id: str = Field(min_length=1, max_length=200)
+    expert_agent_id: str | None = Field(default=None, min_length=1, max_length=200)
+    summary: str = Field(min_length=1, max_length=4_000)
+
+
+class ExpertAssessment(BaseModel):
+    summary: str = Field(min_length=1, max_length=8_000)
+    risks: list[str] = Field(default_factory=list, max_length=16)
+    missed_opportunities: list[str] = Field(default_factory=list, max_length=16)
+    suggested_checks: list[str] = Field(default_factory=list, max_length=16)
+    recommended_next_prompt: str | None = Field(default=None, max_length=20_000)
+
+
 class JudgeDecision(BaseModel):
     decision: WorkflowDecisionType
     summary: str = Field(min_length=1, max_length=8_000)
@@ -279,6 +301,7 @@ class WorkflowRunState(BaseModel):
     status: WorkflowRunStatus = "starting"
     phase: WorkflowPhase = "idle"
     codex_agent_id: str
+    router_agent_id: str | None = None
     judge_agent_id: str
     started_at: datetime
     updated_at: datetime
@@ -289,8 +312,10 @@ class WorkflowRunState(BaseModel):
     max_judge_calls: int
     max_runtime_minutes: int
     expert_agent_id: str | None = None
+    last_routing_decision: RunRoutingDecision | None = None
     last_codex_output: str | None = None
     last_expert_assessment: str | None = None
+    last_expert_report: ExpertAssessment | None = None
     last_judge_decision: WorkflowDecisionType | None = None
     last_judge_summary: str | None = None
     last_continuation_prompt: str | None = Field(default=None, max_length=20_000)

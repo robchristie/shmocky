@@ -17,6 +17,7 @@ from shmocky.models import (
     DashboardState,
     OracleResumeCheckpoint,
     PendingServerRequest,
+    RunRoutingDecision,
     ServerRequestResolutionRequest,
     ThreadState,
     TranscriptItem,
@@ -86,6 +87,50 @@ Focus on benchmark realism and preserve correctness.
         "Continue from the current repository state.\n\n"
         "Focus on benchmark realism and preserve correctness."
     )
+
+
+def test_supervisor_parses_labeled_text_expert_response() -> None:
+    report = WorkflowSupervisor._parse_expert_assessment(
+        """Summary: The current change is close but still under-verified.
+Risks:
+- Benchmark coverage is too narrow.
+- Error handling remains implicit.
+Missed opportunities:
+- Add a regression fixture for the failure case.
+Suggested checks:
+- Run the benchmark suite against two representative inputs.
+Recommended next prompt:
+Expand verification coverage before accepting the result.
+"""
+    )
+
+    assert report.summary == "The current change is close but still under-verified."
+    assert report.risks == [
+        "Benchmark coverage is too narrow.",
+        "Error handling remains implicit.",
+    ]
+    assert report.missed_opportunities == [
+        "Add a regression fixture for the failure case."
+    ]
+    assert report.suggested_checks == [
+        "Run the benchmark suite against two representative inputs."
+    ]
+    assert (
+        report.recommended_next_prompt
+        == "Expand verification coverage before accepting the result."
+    )
+
+
+def test_supervisor_falls_back_to_summary_only_expert_response() -> None:
+    report = WorkflowSupervisor._parse_expert_assessment(
+        "The run is close to done, but benchmark coverage still looks thin."
+    )
+
+    assert report.summary == "The run is close to done, but benchmark coverage still looks thin."
+    assert report.risks == []
+    assert report.missed_opportunities == []
+    assert report.suggested_checks == []
+    assert report.recommended_next_prompt is None
 
 
 def test_supervisor_render_template_preserves_literal_json_braces() -> None:
@@ -869,6 +914,134 @@ judge_agent = "judge"
     assert manifest_payload["workspace"]["sourceRepoRoot"] == str(source_repo_root)
     assert manifest_payload["workspace"]["executionDir"] == run.execution_dir
     assert manifest_payload["workspace"]["workspaceStrategy"] == "git_worktree"
+
+
+def test_supervisor_start_run_applies_router_selection_before_builder_starts(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "shmocky.toml"
+    config_path.write_text(
+        """
+[agents.router]
+provider = "codex"
+role = "router"
+
+[agents.builder]
+provider = "codex"
+role = "builder"
+model = "gpt-5.3-codex-spark"
+
+[agents.builder_alt]
+provider = "codex"
+role = "builder"
+model = "gpt-5.4"
+
+[agents.judge]
+provider = "codex"
+role = "judge"
+
+[agents.judge_alt]
+provider = "codex"
+role = "judge"
+
+[agents.expert]
+provider = "oracle"
+role = "expert"
+
+[workflows.plan_execute_judge]
+router_agent = "router"
+executor_agent = "builder"
+expert_agent = "expert"
+judge_agent = "judge"
+router_executor_options = ["builder", "builder_alt"]
+router_judge_options = ["judge", "judge_alt"]
+router_expert_options = ["expert"]
+""".strip(),
+        encoding="utf-8",
+    )
+    source_repo_root = tmp_path.parent / f"{tmp_path.name}-router-repo"
+    _init_git_repo(source_repo_root)
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            workflow_config_path=config_path,
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+    recorded: dict[str, str] = {}
+
+    async def fake_route_agents(
+        *,
+        workflow: object,
+        router_agent: object,
+        agent_by_id: dict[str, object],
+    ) -> tuple[object, object | None, object, RunRoutingDecision]:
+        return (
+            agent_by_id["builder_alt"],
+            None,
+            agent_by_id["judge_alt"],
+            RunRoutingDecision(
+                workflow_id="plan_execute_judge",
+                executor_agent_id="builder_alt",
+                judge_agent_id="judge_alt",
+                expert_agent_id=None,
+                summary="Use the stronger builder and skip the expert hop.",
+            ),
+        )
+
+    async def successful_start_bridge(target_dir: Path, codex_agent: object, **_: object) -> None:
+        recorded["execution_dir"] = str(target_dir)
+        recorded["builder_role"] = getattr(codex_agent, "role")
+        recorded["builder_model"] = getattr(codex_agent, "model")
+
+    async def fake_execute_run(*args: object, **kwargs: object) -> None:
+        await supervisor._finish_run(
+            status="stopped",
+            phase="stopped",
+            note="test cleanup",
+        )
+
+    async def exercise() -> DashboardSnapshot:
+        cast(Any, supervisor)._route_agents = fake_route_agents
+        cast(Any, supervisor)._start_bridge = successful_start_bridge
+        cast(Any, supervisor)._execute_run = fake_execute_run
+        snapshot = await supervisor.start_run(
+            WorkflowRunRequest(
+                workflow_id="plan_execute_judge",
+                target_dir=str(source_repo_root),
+                prompt="test routed worktree",
+            )
+        )
+        await asyncio.sleep(0)
+        return snapshot
+
+    snapshot = asyncio.run(exercise())
+
+    assert snapshot.state.workflow_run is not None
+    run = snapshot.state.workflow_run
+    assert run.router_agent_id == "router"
+    assert run.codex_agent_id == "builder_alt"
+    assert run.judge_agent_id == "judge_alt"
+    assert run.expert_agent_id is None
+    assert run.last_routing_decision is not None
+    assert run.last_routing_decision.summary == "Use the stronger builder and skip the expert hop."
+    assert recorded["execution_dir"] == run.execution_dir
+    assert recorded["builder_role"] == "builder"
+    assert recorded["builder_model"] == "gpt-5.4"
+
+    manifest_payload = json.loads(
+        (tmp_path / ".shmocky" / "runs" / run.id / WorkflowSupervisor.RUN_MANIFEST_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest_payload["agents"]["builder"]["id"] == "builder_alt"
+    assert manifest_payload["agents"]["router"]["id"] == "router"
+    assert manifest_payload["agents"]["expert"] is None
+    assert manifest_payload["agents"]["judge"]["id"] == "judge_alt"
+    assert manifest_payload["routingDecision"]["summary"] == (
+        "Use the stronger builder and skip the expert hop."
+    )
 
 
 def test_supervisor_rolls_back_failed_run_start(tmp_path: Path) -> None:

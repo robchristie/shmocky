@@ -24,9 +24,11 @@ from .models import (
     ConnectionState,
     DashboardSnapshot,
     DashboardState,
+    ExpertAssessment,
     JudgeDecision,
     OracleQueryRequest,
     OracleResumeCheckpoint,
+    RunRoutingDecision,
     RunHistoryEntry,
     RunHistoryResponse,
     ServerRequestResolutionRequest,
@@ -72,6 +74,7 @@ class RunResources:
 class LoadedRunContext:
     workflow: WorkflowDefinition
     codex_agent: AgentDefinition
+    router_agent: AgentDefinition | None
     expert_agent: AgentDefinition | None
     judge_agent: AgentDefinition
 
@@ -83,6 +86,12 @@ class PreparedExecutionWorkspace:
     workspace_strategy: Literal["git_worktree"]
     worktree_branch: str
     worktree_base_commit: str
+
+
+@dataclass(slots=True)
+class ExpertAssessmentResult:
+    raw_text: str
+    report: ExpertAssessment
 
 
 class WorkflowSupervisor:
@@ -202,7 +211,14 @@ class WorkflowSupervisor:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             workflow = WorkflowDefinition.model_validate(payload["workflow"])
             agents_payload = payload["agents"]
-            codex_agent = AgentDefinition.model_validate(agents_payload["codex"])
+            codex_payload = agents_payload.get("builder") or agents_payload["codex"]
+            codex_agent = AgentDefinition.model_validate(codex_payload)
+            router_payload = agents_payload.get("router")
+            router_agent = (
+                AgentDefinition.model_validate(router_payload)
+                if isinstance(router_payload, dict)
+                else None
+            )
             expert_payload = agents_payload.get("expert")
             expert_agent = (
                 AgentDefinition.model_validate(expert_payload)
@@ -217,6 +233,7 @@ class WorkflowSupervisor:
         return LoadedRunContext(
             workflow=workflow,
             codex_agent=codex_agent,
+            router_agent=router_agent,
             expert_agent=expert_agent,
             judge_agent=judge_agent,
         )
@@ -425,6 +442,11 @@ class WorkflowSupervisor:
 
             agent_by_id = {agent.id: agent for agent in catalog.agents}
             codex_agent = agent_by_id[workflow.executor_agent]
+            router_agent = (
+                agent_by_id[workflow.router_agent]
+                if workflow.router_agent is not None
+                else None
+            )
             expert_agent = (
                 agent_by_id[workflow.expert_agent]
                 if workflow.expert_agent is not None
@@ -457,6 +479,7 @@ class WorkflowSupervisor:
                 status="starting",
                 phase="idle",
                 codex_agent_id=codex_agent.id,
+                router_agent_id=router_agent.id if router_agent is not None else None,
                 expert_agent_id=expert_agent.id if expert_agent is not None else None,
                 judge_agent_id=judge_agent.id,
                 started_at=datetime.now(UTC),
@@ -465,6 +488,25 @@ class WorkflowSupervisor:
                 max_judge_calls=workflow.max_judge_calls,
                 max_runtime_minutes=workflow.max_runtime_minutes,
             )
+            if router_agent is not None:
+                (
+                    codex_agent,
+                    expert_agent,
+                    judge_agent,
+                    routing_decision,
+                ) = await self._route_agents(
+                    workflow=workflow,
+                    router_agent=router_agent,
+                    agent_by_id=agent_by_id,
+                )
+                if self._run_state is None:
+                    raise WorkflowSupervisorError("Workflow run disappeared during routing.")
+                self._run_state.codex_agent_id = codex_agent.id
+                self._run_state.expert_agent_id = (
+                    expert_agent.id if expert_agent is not None else None
+                )
+                self._run_state.judge_agent_id = judge_agent.id
+                self._run_state.last_routing_decision = routing_decision
             self._write_json(
                 run_dir / self.RUN_MANIFEST_FILENAME,
                 {
@@ -472,7 +514,12 @@ class WorkflowSupervisor:
                     "request": payload.model_dump(mode="json"),
                     "workflow": workflow.model_dump(mode="json"),
                     "agents": {
-                        "codex": codex_agent.model_dump(mode="json"),
+                        "builder": codex_agent.model_dump(mode="json"),
+                        "router": (
+                            router_agent.model_dump(mode="json")
+                            if router_agent is not None
+                            else None
+                        ),
                         "expert": (
                             expert_agent.model_dump(mode="json")
                             if expert_agent is not None
@@ -487,6 +534,11 @@ class WorkflowSupervisor:
                         "worktreeBranch": workspace.worktree_branch,
                         "worktreeBaseCommit": workspace.worktree_base_commit,
                     },
+                    "routingDecision": (
+                        self._run_state.last_routing_decision.model_dump(mode="json")
+                        if self._run_state.last_routing_decision is not None
+                        else None
+                    ),
                 },
             )
             self._stage_run_snapshot()
@@ -510,6 +562,15 @@ class WorkflowSupervisor:
                         "workspaceStrategy": workspace.workspace_strategy,
                         "worktreeBranch": workspace.worktree_branch,
                         "worktreeBaseCommit": workspace.worktree_base_commit,
+                        "routerAgentId": router_agent.id if router_agent is not None else None,
+                        "builderAgentId": codex_agent.id,
+                        "expertAgentId": expert_agent.id if expert_agent is not None else None,
+                        "judgeAgentId": judge_agent.id,
+                        "routingSummary": (
+                            self._run_state.last_routing_decision.summary
+                            if self._run_state.last_routing_decision is not None
+                            else None
+                        ),
                     },
                 )
                 await self._start_bridge(workspace.execution_dir, codex_agent)
@@ -758,6 +819,47 @@ class WorkflowSupervisor:
         except asyncio.CancelledError:
             return
 
+    async def _route_agents(
+        self,
+        *,
+        workflow: WorkflowDefinition,
+        router_agent: AgentDefinition,
+        agent_by_id: dict[str, AgentDefinition],
+    ) -> tuple[AgentDefinition, AgentDefinition | None, AgentDefinition, RunRoutingDecision]:
+        if self._run_state is None:
+            raise WorkflowSupervisorError("No workflow run exists.")
+        self._run_state.phase = "routing"
+        self._run_state.updated_at = datetime.now(UTC)
+        await self._record_workflow_event(
+            "routing_started",
+            f"Started router selection with agent '{router_agent.id}'.",
+            payload={"agentId": router_agent.id},
+        )
+        routing_bundle = self._build_routing_bundle(workflow, agent_by_id)
+        router_prompt = self._render_agent_prompt(
+            workflow.router_prompt_template or "",
+            agent=router_agent,
+            goal=self._run_state.goal,
+            routing_bundle=routing_bundle,
+            judge_bundle="",
+            last_output="",
+            expert_assessment="",
+        )
+        decision = await self._run_router(router_agent, workflow, router_prompt)
+        executor = agent_by_id[decision.executor_agent_id]
+        judge = agent_by_id[decision.judge_agent_id]
+        expert = (
+            agent_by_id[decision.expert_agent_id]
+            if decision.expert_agent_id is not None
+            else None
+        )
+        await self._record_workflow_event(
+            "routing_completed",
+            "Router selected the workflow agent composition.",
+            payload=decision.model_dump(mode="json"),
+        )
+        return executor, expert, judge, decision
+
     async def _execute_run(
         self,
         workflow: Any,
@@ -809,6 +911,7 @@ class WorkflowSupervisor:
             loop_index = checkpoint.loop_index
             codex_output = self._run_state.last_codex_output
             expert_assessment = self._run_state.last_expert_assessment
+            expert_report = self._run_state.last_expert_report
 
             if checkpoint.agent_label == "expert":
                 expert_agent = context.expert_agent
@@ -822,7 +925,9 @@ class WorkflowSupervisor:
                 )
                 while True:
                     try:
-                        expert_assessment = await self._run_expert(expert_agent, checkpoint.prompt)
+                        expert_result = await self._run_expert(expert_agent, checkpoint.prompt)
+                        expert_assessment = self._format_expert_assessment(expert_result.report)
+                        expert_report = expert_result.report
                         break
                     except (OracleAgentError, OracleNotConfiguredError) as exc:
                         if expert_agent.provider != "oracle":
@@ -842,11 +947,13 @@ class WorkflowSupervisor:
                     expert_assessment,
                     limit=8_000,
                 )
+                self._run_state.last_expert_report = expert_report
                 await self._ensure_checkpoint("judging", f"Judge evaluation loop {loop_index}.")
                 await self._check_budgets(loop_index, before_judge=True)
                 judge_bundle = await self._build_judge_bundle(
                     codex_output,
                     expert_assessment=expert_assessment,
+                    expert_report=expert_report,
                 )
                 judge_prompt = self._render_agent_prompt(
                     context.workflow.judge_prompt_template,
@@ -861,8 +968,8 @@ class WorkflowSupervisor:
                     "judging",
                     f"Resuming judge evaluation loop {loop_index}.",
                 )
-                await self._check_budgets(loop_index, before_judge=True)
-                judge_prompt = checkpoint.prompt
+            await self._check_budgets(loop_index, before_judge=True)
+            judge_prompt = checkpoint.prompt
 
             while True:
                 try:
@@ -929,6 +1036,7 @@ class WorkflowSupervisor:
             self._run_state.last_codex_output = self._clip(codex_output)
 
             expert_assessment: str | None = None
+            expert_report: ExpertAssessment | None = None
             if expert_agent is not None and workflow.expert_prompt_template is not None:
                 await self._ensure_checkpoint(
                     "advising",
@@ -937,6 +1045,7 @@ class WorkflowSupervisor:
                 expert_bundle = await self._build_judge_bundle(
                     codex_output,
                     expert_assessment=None,
+                    expert_report=None,
                 )
                 expert_prompt = self._render_agent_prompt(
                     workflow.expert_prompt_template,
@@ -948,7 +1057,9 @@ class WorkflowSupervisor:
                 )
                 while True:
                     try:
-                        expert_assessment = await self._run_expert(expert_agent, expert_prompt)
+                        expert_result = await self._run_expert(expert_agent, expert_prompt)
+                        expert_assessment = self._format_expert_assessment(expert_result.report)
+                        expert_report = expert_result.report
                         break
                     except (OracleAgentError, OracleNotConfiguredError) as exc:
                         if expert_agent.provider != "oracle":
@@ -968,12 +1079,14 @@ class WorkflowSupervisor:
                     expert_assessment,
                     limit=8_000,
                 )
+                self._run_state.last_expert_report = expert_report
 
             await self._ensure_checkpoint("judging", f"Judge evaluation loop {loop_index}.")
             await self._check_budgets(loop_index, before_judge=True)
             judge_bundle = await self._build_judge_bundle(
                 codex_output,
                 expert_assessment=expert_assessment,
+                expert_report=expert_report,
             )
             judge_prompt = self._render_agent_prompt(
                 workflow.judge_prompt_template,
@@ -1069,7 +1182,34 @@ class WorkflowSupervisor:
             raise WorkflowSupervisorError("Codex completed the turn without an assistant message.")
         return assistant_text
 
-    async def _run_expert(self, expert_agent: Any, prompt: str) -> str:
+    async def _run_router(
+        self,
+        router_agent: AgentDefinition,
+        workflow: WorkflowDefinition,
+        prompt: str,
+    ) -> RunRoutingDecision:
+        if self._resources is not None:
+            self._write_json(self._resources.run_dir / "last-router-request.json", {"prompt": prompt})
+        raw_answer = await self._run_aux_codex_turn(
+            router_agent,
+            prompt,
+            event_log_subdir="router-codex-events",
+            label="router",
+            output_schema=self._router_output_schema(workflow),
+        )
+        decision = RunRoutingDecision.model_validate_json(self._extract_json(raw_answer))
+        if self._resources is not None:
+            self._write_json(
+                self._resources.run_dir / "last-router-response.json",
+                {
+                    "answer": raw_answer,
+                    "provider": "codex",
+                    "decision": decision.model_dump(mode="json"),
+                },
+            )
+        return decision
+
+    async def _run_expert(self, expert_agent: Any, prompt: str) -> ExpertAssessmentResult:
         if self._resources is not None:
             self._write_json(self._resources.run_dir / "last-expert-request.json", {"prompt": prompt})
         await self._record_workflow_event(
@@ -1077,6 +1217,8 @@ class WorkflowSupervisor:
             f"Started {expert_agent.provider} expert assessment.",
             payload={"agentId": expert_agent.id, "provider": expert_agent.provider},
         )
+        remote_host: str | None = None
+        duration_seconds: float | None = None
         if expert_agent.provider == "oracle":
             response = await self._oracle.query(
                 OracleQueryRequest(prompt=prompt),
@@ -1087,41 +1229,42 @@ class WorkflowSupervisor:
                 prompt_char_limit=expert_agent.prompt_char_limit,
             )
             answer = response.answer.strip()
-            if self._resources is not None:
-                self._write_json(
-                    self._resources.run_dir / "last-expert-response.json",
-                    {
-                        "answer": answer,
-                        "provider": "oracle",
-                        "remoteHost": response.remote_host,
-                        "durationSeconds": response.duration_seconds,
-                    },
-                )
+            remote_host = response.remote_host
+            duration_seconds = response.duration_seconds
         else:
             answer = await self._run_aux_codex_turn(
                 expert_agent,
                 prompt,
                 event_log_subdir="expert-codex-events",
                 label="expert",
+                output_schema=self._expert_output_schema(),
             )
-            if self._resources is not None:
-                self._write_json(
-                    self._resources.run_dir / "last-expert-response.json",
-                    {
-                        "answer": answer,
-                        "provider": "codex",
-                    },
-                )
+        report = self._parse_expert_assessment(answer)
+        if self._resources is not None:
+            response_payload: dict[str, object] = {
+                "answer": answer,
+                "provider": expert_agent.provider,
+                "report": report.model_dump(mode="json"),
+            }
+            if remote_host is not None:
+                response_payload["remoteHost"] = remote_host
+            if duration_seconds is not None:
+                response_payload["durationSeconds"] = duration_seconds
+            self._write_json(
+                self._resources.run_dir / "last-expert-response.json",
+                response_payload,
+            )
         await self._record_workflow_event(
             "expert_completed",
             f"Completed {expert_agent.provider} expert assessment.",
             payload={
                 "agentId": expert_agent.id,
                 "provider": expert_agent.provider,
-                "answer": self._clip(answer, limit=2_000),
+                "summary": self._clip(report.summary, limit=1_000),
+                "recommendedNextPrompt": self._clip(report.recommended_next_prompt, limit=2_000),
             },
         )
-        return answer
+        return ExpertAssessmentResult(raw_text=answer, report=report)
 
     async def _run_judge(self, judge_agent: Any, prompt: str) -> JudgeDecision:
         if self._resources is not None:
@@ -1353,6 +1496,7 @@ class WorkflowSupervisor:
         codex_output: str,
         *,
         expert_assessment: str | None,
+        expert_report: ExpertAssessment | None,
     ) -> str:
         if self._run_state is None:
             raise WorkflowSupervisorError("No workflow run exists.")
@@ -1365,11 +1509,19 @@ class WorkflowSupervisor:
             "workflowId": self._run_state.workflow_id,
             "targetDir": self._run_state.target_dir,
             "executionDir": self._run_state.execution_dir,
+            "routingDecision": (
+                self._run_state.last_routing_decision.model_dump(mode="json")
+                if self._run_state.last_routing_decision is not None
+                else None
+            ),
             "loop": self._run_state.current_loop,
             "judgeCalls": self._run_state.judge_calls,
             "recentSteeringNotes": self._run_state.recent_steering_notes[-5:],
             "lastCodexOutput": self._clip(codex_output, limit=8_000),
             "expertAssessment": self._clip(expert_assessment, limit=8_000),
+            "expertReport": (
+                expert_report.model_dump(mode="json") if expert_report is not None else None
+            ),
             "codexLastError": (
                 bridge_snapshot.state.turn.error
                 if bridge_snapshot is not None and bridge_snapshot.state.turn is not None
@@ -1477,9 +1629,88 @@ class WorkflowSupervisor:
             "</task_update>"
         )
 
+    def _build_routing_bundle(
+        self,
+        workflow: WorkflowDefinition,
+        agent_by_id: dict[str, AgentDefinition],
+    ) -> str:
+        if self._run_state is None:
+            raise WorkflowSupervisorError("No workflow run exists.")
+        payload = {
+            "goal": self._run_state.goal,
+            "workflowId": workflow.id,
+            "targetDir": self._run_state.target_dir,
+            "executionDir": self._run_state.execution_dir,
+            "candidates": {
+                "executorAgents": [
+                    self._agent_summary(agent_by_id[agent_id])
+                    for agent_id in workflow.router_executor_options
+                ],
+                "judgeAgents": [
+                    self._agent_summary(agent_by_id[agent_id])
+                    for agent_id in workflow.router_judge_options
+                ],
+                "expertAgents": [
+                    self._agent_summary(agent_by_id[agent_id])
+                    for agent_id in workflow.router_expert_options
+                ],
+                "allowNoExpert": True,
+            },
+        }
+        return json.dumps(payload, ensure_ascii=True, indent=2)
+
+    @staticmethod
+    def _agent_summary(agent: AgentDefinition) -> dict[str, object]:
+        return {
+            "id": agent.id,
+            "provider": agent.provider,
+            "role": agent.role,
+            "description": agent.description,
+            "model": agent.model,
+            "reasoningEffort": agent.reasoning_effort,
+            "webAccess": agent.web_access,
+        }
+
     @staticmethod
     def _judge_output_schema() -> dict[str, Any]:
         return JudgeDecision.model_json_schema()
+
+    @staticmethod
+    def _expert_output_schema() -> dict[str, Any]:
+        return ExpertAssessment.model_json_schema()
+
+    @staticmethod
+    def _router_output_schema(workflow: WorkflowDefinition) -> dict[str, Any]:
+        expert_options = [
+            {"type": "string", "enum": workflow.router_expert_options},
+            {"type": "null"},
+        ]
+        if not workflow.router_expert_options:
+            expert_options = [{"type": "null"}]
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "workflow_id": {"type": "string", "enum": [workflow.id]},
+                "executor_agent_id": {
+                    "type": "string",
+                    "enum": workflow.router_executor_options,
+                },
+                "judge_agent_id": {
+                    "type": "string",
+                    "enum": workflow.router_judge_options,
+                },
+                "expert_agent_id": {"anyOf": expert_options},
+                "summary": {"type": "string"},
+            },
+            "required": [
+                "workflow_id",
+                "executor_agent_id",
+                "judge_agent_id",
+                "expert_agent_id",
+                "summary",
+            ],
+        }
 
     @staticmethod
     def _assistant_text_for_turn(snapshot: DashboardSnapshot, turn_id: str) -> str:
@@ -1578,6 +1809,83 @@ class WorkflowSupervisor:
         except WorkflowSupervisorError:
             pass
 
+    @classmethod
+    def _parse_expert_assessment(cls, raw_answer: str) -> ExpertAssessment:
+        json_error: Exception | None = None
+        try:
+            payload = cls._extract_json(raw_answer)
+            return ExpertAssessment.model_validate_json(payload)
+        except (ValidationError, WorkflowSupervisorError) as exc:
+            json_error = exc
+
+        try:
+            return cls._parse_expert_text_assessment(raw_answer)
+        except ValidationError as exc:
+            fallback = cls._fallback_expert_assessment(raw_answer)
+            if fallback is not None:
+                return fallback
+            raise WorkflowSupervisorError(
+                "Expert returned a malformed assessment payload that could not be parsed."
+            ) from exc
+        except WorkflowSupervisorError as exc:
+            fallback = cls._fallback_expert_assessment(raw_answer)
+            if fallback is not None:
+                return fallback
+            raise WorkflowSupervisorError(
+                "Expert returned a malformed assessment payload that could not be parsed."
+            ) from (json_error or exc)
+
+    @classmethod
+    def _parse_expert_text_assessment(cls, raw_answer: str) -> ExpertAssessment:
+        text = cls._strip_code_fence(raw_answer)
+        sections = cls._extract_labeled_sections(
+            text,
+            (
+                "summary",
+                "risks",
+                "missed opportunities",
+                "suggested checks",
+                "recommended next prompt",
+            ),
+        )
+        summary = sections.get("summary")
+        if not summary:
+            raise WorkflowSupervisorError("Expert response is missing a Summary section.")
+        payload: dict[str, object] = {
+            "summary": summary.strip(),
+            "risks": cls._extract_bullets(sections.get("risks")),
+            "missed_opportunities": cls._extract_bullets(sections.get("missed opportunities")),
+            "suggested_checks": cls._extract_bullets(sections.get("suggested checks")),
+        }
+        recommended_next_prompt = sections.get("recommended next prompt")
+        if recommended_next_prompt:
+            payload["recommended_next_prompt"] = recommended_next_prompt.strip()
+        return ExpertAssessment.model_validate(payload)
+
+    @staticmethod
+    def _format_expert_assessment(report: ExpertAssessment) -> str:
+        sections = [f"Summary:\n{report.summary.strip()}"]
+        for title, items in (
+            ("Risks", report.risks),
+            ("Missed opportunities", report.missed_opportunities),
+            ("Suggested checks", report.suggested_checks),
+        ):
+            bullet_block = "\n".join(f"- {item}" for item in items) if items else "- none"
+            sections.append(f"{title}:\n{bullet_block}")
+        if report.recommended_next_prompt:
+            sections.append(
+                "Recommended next prompt:\n"
+                + report.recommended_next_prompt.strip()
+            )
+        return "\n\n".join(sections)
+
+    @classmethod
+    def _fallback_expert_assessment(cls, raw_answer: str) -> ExpertAssessment | None:
+        summary = cls._clip(cls._strip_code_fence(raw_answer), limit=8_000)
+        if not summary:
+            return None
+        return ExpertAssessment(summary=summary)
+
     @staticmethod
     def _extract_json(text: str) -> str:
         stripped = text.strip()
@@ -1673,13 +1981,15 @@ class WorkflowSupervisor:
         return "\n".join(body_lines).strip()
 
     @staticmethod
-    def _extract_judge_text_sections(text: str) -> dict[str, str]:
-        pattern = re.compile(
-            r"(?im)^(Decision|Summary|Next prompt|Completion note|Failure reason)\s*:\s*"
-        )
+    def _extract_labeled_sections(
+        text: str,
+        labels: tuple[str, ...],
+    ) -> dict[str, str]:
+        escaped_labels = "|".join(re.escape(label) for label in labels)
+        pattern = re.compile(rf"(?im)^({escaped_labels})\s*:\s*")
         matches = list(pattern.finditer(text))
         if not matches:
-            raise WorkflowSupervisorError("Judge text response does not use the expected labels.")
+            raise WorkflowSupervisorError("Response does not use the expected labels.")
 
         sections: dict[str, str] = {}
         for index, match in enumerate(matches):
@@ -1688,6 +1998,28 @@ class WorkflowSupervisor:
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
             sections[section_name] = text[start:end].strip()
         return sections
+
+    @classmethod
+    def _extract_judge_text_sections(cls, text: str) -> dict[str, str]:
+        return cls._extract_labeled_sections(
+            text,
+            ("Decision", "Summary", "Next prompt", "Completion note", "Failure reason"),
+        )
+
+    @staticmethod
+    def _extract_bullets(text: str | None) -> list[str]:
+        if not text:
+            return []
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        bullets: list[str] = []
+        for line in lines:
+            if line.startswith("- "):
+                bullets.append(line[2:].strip())
+            elif line.startswith("* "):
+                bullets.append(line[2:].strip())
+            elif line != "- none" and line != "none":
+                bullets.append(line)
+        return bullets
 
     @staticmethod
     def _extract_string_field(payload: str, field_name: str) -> str | None:

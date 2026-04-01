@@ -44,6 +44,18 @@ startup_prompt = """
 </action_safety>
 """
 
+[agents.router]
+provider = "codex"
+role = "router"
+model = "gpt-5.3-codex-spark"
+reasoning_effort = "low"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+web_access = "disabled"
+startup_prompt = """
+You are the workflow router. Choose only from the allowed workflow and agent ids, and emit only the schema-constrained routing decision for the current run.
+"""
+
 [agents.expert]
 provider = "oracle"
 role = "expert"
@@ -52,7 +64,7 @@ model_strategy = "current"
 timeout_seconds = 3600
 prompt_char_limit = 40000
 startup_prompt = """
-You are the workflow expert advisor. Return plain text analysis and concrete suggestions only.
+You are the workflow expert advisor. Return either the requested JSON object or labeled sections for summary, risks, missed opportunities, suggested checks, and recommended next prompt.
 """
 
 [agents.judge]
@@ -69,6 +81,7 @@ You are the workflow judge. Evaluate the run evidence strictly and emit only the
 
 [workflows.plan_execute_judge]
 kind = "linear_loop"
+router_agent = "router"
 executor_agent = "builder"
 expert_agent = "expert"
 judge_agent = "judge"

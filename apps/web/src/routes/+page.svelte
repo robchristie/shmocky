@@ -911,6 +911,21 @@ function transcriptExtras(): DerivedTranscriptEntry[] {
 		return [];
 	}
 	const extras: DerivedTranscriptEntry[] = [];
+	if (run.last_routing_decision) {
+		const expertLine = run.last_routing_decision.expert_agent_id ?? "none";
+		extras.push({
+			id: `routing-decision-${run.id}`,
+			speaker: "Router",
+			title: "Routing Decision",
+			body:
+				`${run.last_routing_decision.summary}\n\n` +
+				`Workflow: ${run.last_routing_decision.workflow_id}\n` +
+				`Builder: ${run.last_routing_decision.executor_agent_id}\n` +
+				`Judge: ${run.last_routing_decision.judge_agent_id}\n` +
+				`Expert: ${expertLine}`,
+			tone: "muted",
+		});
+	}
 	if (run.last_expert_assessment) {
 		extras.push({
 			id: `expert-assessment-${run.id}`,
@@ -1569,6 +1584,10 @@ onMount(() => {
 							</div>
 							{#if selectedWorkflow()}
 								<div class="grid gap-2 border-t border-border pt-3 text-[0.76rem] text-muted-foreground">
+									<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
+										<div>Router</div>
+										<div class="truncate text-foreground">{selectedWorkflow()?.router_agent ?? "—"}</div>
+									</div>
 									<div class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3">
 										<div>Builder</div>
 										<div class="truncate text-foreground">{selectedWorkflow()?.executor_agent}</div>
