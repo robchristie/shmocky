@@ -58,34 +58,60 @@ class CodexAppServerBridge:
 
     async def start(self) -> None:
         self._settings.event_log_dir.mkdir(parents=True, exist_ok=True)
-        self._process = await asyncio.create_subprocess_exec(
-            self._settings.codex_command,
-            "app-server",
-            cwd=str(self._workspace_root),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        self._projection.mark_process_started(self._process.pid)
-        await self._append_internal_event(
-            message="codex app-server started",
-            payload={"pid": self._process.pid},
-        )
-        self._reader_task = asyncio.create_task(self._read_stdout())
-        self._stderr_task = asyncio.create_task(self._read_stderr())
-        await self._call(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "shmocky",
-                    "title": "Shmocky Browser Mirror",
-                    "version": "0.1.0",
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                self._settings.codex_command,
+                "app-server",
+                cwd=str(self._workspace_root),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self._projection.mark_process_started(self._process.pid)
+            await self._append_internal_event(
+                message="codex app-server started",
+                payload={"pid": self._process.pid},
+            )
+            self._reader_task = asyncio.create_task(self._read_stdout())
+            self._stderr_task = asyncio.create_task(self._read_stderr())
+            await self._call(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "shmocky",
+                        "title": "Shmocky Browser Mirror",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {
+                        "experimentalApi": self._settings.experimental_api,
+                    },
                 },
-                "capabilities": {
-                    "experimentalApi": self._settings.experimental_api,
-                },
-            },
-        )
+            )
+        except Exception:
+            await self._cleanup_failed_start()
+            raise
+
+    async def _cleanup_failed_start(self) -> None:
+        for request_id, (_, future) in list(self._pending.items()):
+            if not future.done():
+                future.cancel()
+            self._pending.pop(request_id, None)
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reader_task
+            self._reader_task = None
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._stderr_task
+            self._stderr_task = None
+        if self._process is not None and self._process.returncode is None:
+            self._process.terminate()
+            with contextlib.suppress(ProcessLookupError, TimeoutError):
+                await asyncio.wait_for(self._process.wait(), timeout=5)
+        self._projection.mark_process_stopped(error="codex app-server failed during startup")
+        self._process = None
 
     async def stop(self) -> None:
         if self._process is None:
@@ -222,16 +248,16 @@ class CodexAppServerBridge:
         try:
             while True:
                 snapshot = self.snapshot()
+                self._raise_if_turn_unavailable(snapshot, turn_id)
                 if self._is_terminal_turn(snapshot, turn_id):
                     return snapshot
                 envelope = await queue.get()
-                if self._is_terminal_turn(
-                    DashboardSnapshot(
-                        state=envelope.state,
-                        recent_events=[],
-                    ),
-                    turn_id,
-                ):
+                envelope_snapshot = DashboardSnapshot(
+                    state=envelope.state,
+                    recent_events=[],
+                )
+                self._raise_if_turn_unavailable(envelope_snapshot, turn_id)
+                if self._is_terminal_turn(envelope_snapshot, turn_id):
                     return self.snapshot()
         finally:
             self.unsubscribe(queue)
@@ -284,13 +310,7 @@ class CodexAppServerBridge:
             line = await self._process.stdout.readline()
             if not line:
                 return_code = await self._process.wait()
-                self._projection.mark_process_stopped(
-                    error=f"codex app-server exited with code {return_code}"
-                )
-                await self._append_internal_event(
-                    message="codex app-server exited",
-                    payload={"returncode": return_code},
-                )
+                await self._handle_process_exit(return_code)
                 return
             raw = line.decode("utf-8").strip()
             if not raw:
@@ -304,6 +324,23 @@ class CodexAppServerBridge:
                 )
                 continue
             await self._handle_inbound_message(message)
+
+    async def _handle_process_exit(self, return_code: int) -> None:
+        error = f"codex app-server exited with code {return_code}"
+        self._projection.mark_process_stopped(error=error)
+        self._fail_pending_calls(error)
+        await self._append_internal_event(
+            message="codex app-server exited",
+            payload={"returncode": return_code},
+        )
+
+    def _fail_pending_calls(self, message: str) -> None:
+        for request_id, (method, future) in list(self._pending.items()):
+            if not future.done():
+                future.set_exception(
+                    BridgeError(f"{method} failed because {message}.")
+                )
+            self._pending.pop(request_id, None)
 
     async def _read_stderr(self) -> None:
         assert self._process is not None
@@ -450,3 +487,21 @@ class CodexAppServerBridge:
         if turn is None or turn.id != turn_id:
             return False
         return turn.status in {"completed", "failed", "cancelled", "interrupted"}
+
+    @staticmethod
+    def _raise_if_turn_unavailable(snapshot: DashboardSnapshot, turn_id: str) -> None:
+        turn = snapshot.state.turn
+        if turn is None or turn.id != turn_id:
+            return
+        if turn.status in {"completed", "failed", "cancelled", "interrupted"}:
+            return
+        connection = snapshot.state.connection
+        if connection.codex_connected:
+            return
+        if connection.last_error:
+            raise BridgeError(
+                f"Turn {turn_id} could not complete because {connection.last_error}."
+            )
+        raise BridgeError(
+            f"Turn {turn_id} could not complete because the codex app-server is unavailable."
+        )

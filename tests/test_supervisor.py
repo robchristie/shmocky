@@ -8,7 +8,7 @@ from typing import Any, cast
 
 import pytest
 
-from shmocky.bridge import CodexAppServerBridge
+from shmocky.bridge import BridgeError, CodexAppServerBridge
 from shmocky.models import (
     ConnectionState,
     DashboardSnapshot,
@@ -19,6 +19,7 @@ from shmocky.models import (
     ThreadState,
     TranscriptItem,
     WorkflowEventRecord,
+    WorkflowRunRequest,
     WorkflowRunState,
 )
 from shmocky.settings import AppSettings
@@ -655,3 +656,84 @@ def test_supervisor_resume_run_restarts_paused_oracle_run_from_manifest(tmp_path
         "workflow_id": "plan_execute_judge",
         "expert_agent_id": "expert",
     }
+
+
+def test_supervisor_rolls_back_failed_run_start(tmp_path: Path) -> None:
+    config_path = tmp_path / "shmocky.toml"
+    config_path.write_text(
+        """
+[agents.engineer]
+provider = "codex"
+role = "engineer"
+
+[agents.judge]
+provider = "codex"
+role = "judge"
+
+[workflows.plan_execute_judge]
+planner_agent = "engineer"
+executor_agent = "engineer"
+judge_agent = "judge"
+""".strip(),
+        encoding="utf-8",
+    )
+    target_dir = tmp_path.parent / f"{tmp_path.name}-target"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    supervisor = WorkflowSupervisor(
+        AppSettings(
+            workspace_root=tmp_path,
+            workflow_config_path=config_path,
+            codex_command="true",
+            oracle_cli_command="true",
+        )
+    )
+
+    async def failing_start_bridge(target_dir: Path, codex_agent: object, **_: object) -> None:
+        raise BridgeError("initialize failed")
+
+    async def successful_start_bridge(target_dir: Path, codex_agent: object, **_: object) -> None:
+        return None
+
+    async def fake_execute_run(*args: object, **kwargs: object) -> None:
+        await supervisor._finish_run(
+            status="stopped",
+            phase="stopped",
+            note="test cleanup",
+        )
+
+    async def exercise() -> DashboardSnapshot:
+        cast(Any, supervisor)._start_bridge = failing_start_bridge
+
+        with pytest.raises(BridgeError, match="initialize failed"):
+            await supervisor.start_run(
+                WorkflowRunRequest(
+                    workflow_id="plan_execute_judge",
+                    target_dir=str(target_dir),
+                    prompt="test startup rollback",
+                )
+            )
+
+        assert supervisor._run_state is None
+        assert supervisor._resources is None
+        assert supervisor._archived_snapshot is None
+        assert list(supervisor._recent_workflow_events) == []
+
+        cast(Any, supervisor)._start_bridge = successful_start_bridge
+        cast(Any, supervisor)._execute_run = fake_execute_run
+
+        snapshot = await supervisor.start_run(
+            WorkflowRunRequest(
+                workflow_id="plan_execute_judge",
+                target_dir=str(target_dir),
+                prompt="test startup retry",
+            )
+        )
+        await asyncio.sleep(0)
+        return snapshot
+
+    snapshot = asyncio.run(exercise())
+
+    assert snapshot.state.workflow_run is not None
+    assert snapshot.state.workflow_run.workflow_id == "plan_execute_judge"
+    assert supervisor._run_state is not None
+    assert supervisor._run_state.status == "stopped"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import subprocess
@@ -457,26 +458,43 @@ class WorkflowSupervisor:
                 },
             )
             self._persist_run_snapshot()
-            await self._record_workflow_event(
-                "run_started",
-                (
-                    f"Started run '{self._run_state.run_name}' using workflow '{workflow.id}' for {target_dir}"
-                    if self._run_state.run_name
-                    else f"Started workflow '{workflow.id}' for {target_dir}"
-                ),
-                payload={
-                    "runId": run_id,
-                    "runName": self._run_state.run_name,
-                    "workflowId": workflow.id,
-                    "targetDir": str(target_dir),
-                },
-            )
-            await self._start_bridge(target_dir, codex_agent)
+            try:
+                await self._record_workflow_event(
+                    "run_started",
+                    (
+                        f"Started run '{self._run_state.run_name}' using workflow '{workflow.id}' for {target_dir}"
+                        if self._run_state.run_name
+                        else f"Started workflow '{workflow.id}' for {target_dir}"
+                    ),
+                    payload={
+                        "runId": run_id,
+                        "runName": self._run_state.run_name,
+                        "workflowId": workflow.id,
+                        "targetDir": str(target_dir),
+                    },
+                )
+                await self._start_bridge(target_dir, codex_agent)
+            except Exception:
+                await self._rollback_failed_run_start()
+                raise
             self._run_task = asyncio.create_task(
                 self._execute_run(workflow, codex_agent, expert_agent, judge_agent)
             )
             await self._broadcast_state()
             return self.snapshot()
+
+    async def _rollback_failed_run_start(self) -> None:
+        await self._stop_bridge()
+        if self._run_task is not None:
+            self._run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._run_task
+            self._run_task = None
+        self._run_state = None
+        self._resources = None
+        self._archived_snapshot = None
+        self._recent_workflow_events.clear()
+        self._pause_gate.set()
 
     def _validate_target_dir(self, target_dir: Path) -> Path:
         resolved = target_dir.expanduser().resolve()

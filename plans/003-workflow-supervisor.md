@@ -92,3 +92,5 @@ Frontend:
 - 2026-04-01: Added live browser handling for pending app-server requests, including approval and request-user-input responses, and fixed pending-request clearing to follow the protocol's `requestId` field.
 - 2026-04-01: Added durable resume semantics for Oracle-blocked pauses by persisting a restart-safe checkpoint, restoring the paused run at startup, and resuming the saved Codex thread before retrying the blocked Oracle step.
 - 2026-04-01: Restricted Oracle file attachments to the configured workspace root, rejecting absolute paths and `..`-based escapes so ad hoc Oracle queries cannot attach arbitrary server files.
+- 2026-04-01: Hardened startup rollback so a failed Codex initialize cannot leave the bridge process or supervisor run state wedged in `starting`; failed starts now clean up the child app-server and clear provisional run state so later runs can proceed.
+- 2026-04-01: Propagated app-server death to bridge callers so pending RPC requests fail immediately and turn waiters stop hanging if Codex exits mid-request or mid-turn.
