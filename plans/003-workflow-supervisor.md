@@ -95,3 +95,4 @@ Frontend:
 - 2026-04-01: Hardened startup rollback so a failed Codex initialize cannot leave the bridge process or supervisor run state wedged in `starting`; failed starts now clean up the child app-server and clear provisional run state so later runs can proceed.
 - 2026-04-01: Propagated app-server death to bridge callers so pending RPC requests fail immediately and turn waiters stop hanging if Codex exits mid-request or mid-turn.
 - 2026-04-01: Debounced dashboard snapshot persistence so streaming bridge events stage in-memory snapshots and flush to disk in batched background writes, while pause/finish/shutdown boundaries still force an immediate durable snapshot.
+- 2026-04-01: Oracle sidecar temp output files are now cleaned up from the outer query path so timeouts and subprocess-start failures do not leak orphaned files under `.shmocky/oracle/`.

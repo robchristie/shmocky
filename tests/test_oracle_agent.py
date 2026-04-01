@@ -242,3 +242,86 @@ def test_oracle_agent_rejects_parent_traversal_attachment_globs(
 
     with pytest.raises(OracleAgentError, match="workspace files"):
         agent._resolve_files(["../secrets/*.txt"])
+
+
+def test_oracle_agent_cleans_up_output_file_on_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ORACLE_REMOTE_TOKEN", raising=False)
+    output_path = tmp_path / ".shmocky" / "oracle" / "timeout-output.txt"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("stale", encoding="utf-8")
+
+    class FakeProcess:
+        returncode = None
+        killed = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.sleep(3600)
+            return b"", b""
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return -9
+
+    async def fake_create_subprocess_exec(
+        *command: str,
+        cwd: str | None = None,
+        stdout: object | None = None,
+        stderr: object | None = None,
+    ) -> FakeProcess:
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    agent = OracleAgent(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+            oracle_remote_token=SecretStr("secret-token"),
+        )
+    )
+    monkeypatch.setattr(agent, "_allocate_output_path", lambda: output_path)
+
+    with pytest.raises(OracleAgentError, match="timed out"):
+        asyncio.run(agent.query(OracleQueryRequest(prompt="hello"), timeout_seconds=0.01))
+
+    assert output_path.exists() is False
+
+
+def test_oracle_agent_cleans_up_output_file_when_subprocess_start_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ORACLE_REMOTE_TOKEN", raising=False)
+    output_path = tmp_path / ".shmocky" / "oracle" / "spawn-failure-output.txt"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("stale", encoding="utf-8")
+
+    async def fake_create_subprocess_exec(
+        *command: str,
+        cwd: str | None = None,
+        stdout: object | None = None,
+        stderr: object | None = None,
+    ) -> object:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    agent = OracleAgent(
+        AppSettings(
+            workspace_root=tmp_path,
+            codex_command="true",
+            oracle_cli_command="true",
+            oracle_remote_token=SecretStr("secret-token"),
+        )
+    )
+    monkeypatch.setattr(agent, "_allocate_output_path", lambda: output_path)
+
+    with pytest.raises(OSError, match="spawn failed"):
+        asyncio.run(agent.query(OracleQueryRequest(prompt="hello")))
+
+    assert output_path.exists() is False

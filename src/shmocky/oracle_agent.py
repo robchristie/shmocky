@@ -75,72 +75,75 @@ class OracleAgent:
 
         attached_files = self._resolve_files(request.files)
         output_path = self._allocate_output_path()
-        effective_remote_host = self._settings._normalize_oracle_remote_host(
-            remote_host or self._settings.oracle_remote_host
-        )
-        effective_chatgpt_url = chatgpt_url.strip() if chatgpt_url is not None else None
-        effective_model_strategy = (
-            model_strategy or self._settings.oracle_browser_model_strategy
-        )
-        effective_timeout_seconds = timeout_seconds or self._settings.oracle_timeout_seconds
-        command = [
-            self._settings.oracle_cli_command,
-            "-y",
-            self._settings.oracle_cli_package,
-            "--engine",
-            self._settings.oracle_engine,
-            "--remote-host",
-            effective_remote_host,
-            "--remote-token",
-            token.get_secret_value(),
-            "--browser-model-strategy",
-            effective_model_strategy,
-            "--write-output",
-            str(output_path),
-        ]
-        if effective_chatgpt_url:
-            command.extend(["--chatgpt-url", effective_chatgpt_url])
-        for path in attached_files:
-            command.extend(["--file", path])
-        command.extend(["-p", request.prompt])
-
-        started_at = monotonic()
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(self._settings.workspace_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
-                timeout=effective_timeout_seconds,
+            effective_remote_host = self._settings._normalize_oracle_remote_host(
+                remote_host or self._settings.oracle_remote_host
             )
-        except TimeoutError as exc:
-            process.kill()
-            await process.wait()
-            raise OracleAgentError(
-                f"Oracle query timed out after {effective_timeout_seconds:.0f}s."
-            ) from exc
+            effective_chatgpt_url = chatgpt_url.strip() if chatgpt_url is not None else None
+            effective_model_strategy = (
+                model_strategy or self._settings.oracle_browser_model_strategy
+            )
+            effective_timeout_seconds = timeout_seconds or self._settings.oracle_timeout_seconds
+            command = [
+                self._settings.oracle_cli_command,
+                "-y",
+                self._settings.oracle_cli_package,
+                "--engine",
+                self._settings.oracle_engine,
+                "--remote-host",
+                effective_remote_host,
+                "--remote-token",
+                token.get_secret_value(),
+                "--browser-model-strategy",
+                effective_model_strategy,
+                "--write-output",
+                str(output_path),
+            ]
+            if effective_chatgpt_url:
+                command.extend(["--chatgpt-url", effective_chatgpt_url])
+            for path in attached_files:
+                command.extend(["--file", path])
+            command.extend(["-p", request.prompt])
 
-        duration_seconds = monotonic() - started_at
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-        answer = self._read_output(output_path).strip()
+            started_at = monotonic()
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(self._settings.workspace_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=effective_timeout_seconds,
+                )
+            except TimeoutError as exc:
+                process.kill()
+                await process.wait()
+                raise OracleAgentError(
+                    f"Oracle query timed out after {effective_timeout_seconds:.0f}s."
+                ) from exc
 
-        if process.returncode != 0:
-            detail = stderr_text or stdout_text or f"Oracle exited with code {process.returncode}."
-            raise OracleAgentError(detail)
-        if not answer:
-            raise OracleAgentError("Oracle exited successfully but did not produce a final answer.")
+            duration_seconds = monotonic() - started_at
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+            answer = self._read_output(output_path).strip()
 
-        return OracleQueryResponse(
-            answer=answer,
-            remote_host=effective_remote_host,
-            duration_seconds=duration_seconds,
-            attached_files=attached_files,
-            stderr=stderr_text or None,
-        )
+            if process.returncode != 0:
+                detail = stderr_text or stdout_text or f"Oracle exited with code {process.returncode}."
+                raise OracleAgentError(detail)
+            if not answer:
+                raise OracleAgentError("Oracle exited successfully but did not produce a final answer.")
+
+            return OracleQueryResponse(
+                answer=answer,
+                remote_host=effective_remote_host,
+                duration_seconds=duration_seconds,
+                attached_files=attached_files,
+                stderr=stderr_text or None,
+            )
+        finally:
+            output_path.unlink(missing_ok=True)
 
     def _resolve_files(self, patterns: list[str]) -> list[str]:
         attached_files: list[str] = []
@@ -185,7 +188,4 @@ class OracleAgent:
             return Path(handle.name)
 
     def _read_output(self, output_path: Path) -> str:
-        try:
-            return output_path.read_text(encoding="utf-8")
-        finally:
-            output_path.unlink(missing_ok=True)
+        return output_path.read_text(encoding="utf-8")
