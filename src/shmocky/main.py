@@ -19,6 +19,7 @@ from .models import (
     WorkflowRunState,
     WorkflowSteerRequest,
 )
+from .notebook_models import NotebookPageListResponse, NotebookPageView
 from .oracle_agent import (
     OracleAgent,
     OracleAgentError,
@@ -84,6 +85,23 @@ def create_app() -> FastAPI:
     async def run_snapshot(run_id: str) -> DashboardSnapshot:
         try:
             return supervisor.load_run_snapshot(run_id)
+        except Exception as exc:
+            raise as_http_error(exc) from exc
+
+    @app.get("/api/runs/{run_id}/notebook", response_model=NotebookPageListResponse)
+    async def run_notebook(run_id: str) -> NotebookPageListResponse:
+        try:
+            return supervisor.notebook_pages(run_id)
+        except Exception as exc:
+            raise as_http_error(exc) from exc
+
+    @app.get(
+        "/api/runs/{run_id}/notebook/{page_id}",
+        response_model=NotebookPageView,
+    )
+    async def run_notebook_page(run_id: str, page_id: str) -> NotebookPageView:
+        try:
+            return supervisor.notebook_page(run_id, page_id)
         except Exception as exc:
             raise as_http_error(exc) from exc
 

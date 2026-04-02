@@ -6,6 +6,9 @@ import { Textarea } from "$lib/components/ui/textarea";
 import type {
 	DashboardSnapshot,
 	DashboardState,
+	NotebookPageListResponse,
+	NotebookPageRecord,
+	NotebookPageView,
 	RawEventRecord,
 	RunHistoryEntry,
 	RunHistoryResponse,
@@ -33,7 +36,7 @@ type DerivedTranscriptEntry = {
 };
 
 type EventStreamMode = "coalesced" | "important" | "raw";
-type OperatorRailTab = "run" | "activity" | "protocol";
+type OperatorRailTab = "run" | "notebook" | "activity" | "protocol";
 
 type PendingQuestionOption = {
 	label: string;
@@ -59,6 +62,9 @@ let dashboardState: DashboardState | null = $state(null);
 let workflowCatalog: WorkflowCatalogResponse | null = $state(null);
 let recentEvents: RawEventRecord[] = $state([]);
 let recentWorkflowEvents: WorkflowEventRecord[] = $state([]);
+let notebookPages: NotebookPageRecord[] = $state([]);
+let selectedNotebookPageId = $state("");
+let selectedNotebookPage: NotebookPageView | null = $state(null);
 let runHistory: RunHistoryEntry[] = $state([]);
 let historicalSnapshot: DashboardSnapshot | null = $state(null);
 let loading = $state(true);
@@ -115,6 +121,13 @@ function livePendingRequest() {
 	return dashboardState?.pending_server_request ?? null;
 }
 
+function selectedNotebookRunId() {
+	if (selectedRunView !== "live") {
+		return selectedRunView;
+	}
+	return liveRun()?.id ?? null;
+}
+
 function viewedState(): DashboardState | null {
 	return historicalSnapshot?.state ?? dashboardState;
 }
@@ -148,6 +161,9 @@ function applyEnvelope(payload: StreamEnvelope | DashboardSnapshot) {
 				...recentWorkflowEvents,
 				payload.workflow_event,
 			].slice(-200);
+			if (selectedRunView === "live") {
+				void refreshNotebook();
+			}
 			if (
 				payload.workflow_event.kind === "run_started" ||
 				payload.workflow_event.kind === "run_completed" ||
@@ -166,6 +182,7 @@ async function refreshState() {
 	try {
 		const snapshot = await request<DashboardSnapshot>("/api/state");
 		applySnapshot(snapshot);
+		await refreshNotebook(snapshot.state.workflow_run?.id ?? null);
 	} catch (error) {
 		requestError = toErrorMessage(error);
 		loading = false;
@@ -198,11 +215,61 @@ async function selectRunView(runId: string) {
 	if (runId === "live") {
 		historicalSnapshot = null;
 		requestError = null;
+		await refreshNotebook();
 		return;
 	}
 	try {
 		historicalSnapshot = await request<DashboardSnapshot>(
 			`/api/runs/${encodeURIComponent(runId)}`,
+		);
+		await refreshNotebook(runId);
+		requestError = null;
+	} catch (error) {
+		requestError = toErrorMessage(error);
+	}
+}
+
+async function refreshNotebook(runId = selectedNotebookRunId()) {
+	if (!runId) {
+		notebookPages = [];
+		selectedNotebookPageId = "";
+		selectedNotebookPage = null;
+		return;
+	}
+	try {
+		const response = await request<NotebookPageListResponse>(
+			`/api/runs/${encodeURIComponent(runId)}/notebook`,
+		);
+		notebookPages = [...response.pages].sort(
+			(left, right) => right.sequence - left.sequence,
+		);
+		if (!notebookPages.length) {
+			selectedNotebookPageId = "";
+			selectedNotebookPage = null;
+			return;
+		}
+		const defaultPageId =
+			selectedNotebookPageId &&
+			notebookPages.some((page) => page.page_id === selectedNotebookPageId)
+				? selectedNotebookPageId
+				: notebookPages[0].page_id;
+		await selectNotebookPage(defaultPageId, runId);
+	} catch (error) {
+		requestError = toErrorMessage(error);
+	}
+}
+
+async function selectNotebookPage(
+	pageId: string,
+	runId = selectedNotebookRunId(),
+) {
+	if (!runId) {
+		return;
+	}
+	selectedNotebookPageId = pageId;
+	try {
+		selectedNotebookPage = await request<NotebookPageView>(
+			`/api/runs/${encodeURIComponent(runId)}/notebook/${encodeURIComponent(pageId)}`,
 		);
 		requestError = null;
 	} catch (error) {
@@ -226,6 +293,7 @@ async function startWorkflowRun() {
 			}),
 		});
 		applySnapshot(snapshot);
+		await refreshNotebook(snapshot.state.workflow_run?.id ?? null);
 		runName = "";
 		startPrompt = "";
 		steerNote = "";
@@ -1338,6 +1406,19 @@ onMount(() => {
 						<button
 							type="button"
 							class={`border-b pb-2 text-[0.84rem] transition-colors ${
+								operatorRailTab === "notebook"
+									? "border-foreground text-foreground"
+									: "border-transparent text-muted-foreground hover:text-foreground"
+							}`}
+							onclick={() => {
+								operatorRailTab = "notebook";
+							}}
+						>
+							Notebook
+						</button>
+						<button
+							type="button"
+							class={`border-b pb-2 text-[0.84rem] transition-colors ${
 								operatorRailTab === "activity"
 									? "border-foreground text-foreground"
 									: "border-transparent text-muted-foreground hover:text-foreground"
@@ -1379,6 +1460,10 @@ onMount(() => {
 					{:else if operatorRailTab === "run"}
 						<div class="text-[0.73rem] text-muted-foreground">
 							Launch a workflow and respond to live Codex approval or input requests.
+						</div>
+					{:else if operatorRailTab === "notebook"}
+						<div class="text-[0.73rem] text-muted-foreground">
+							High-signal notebook pages derived from run milestones and stored artifacts.
 						</div>
 					{:else}
 						<div class="text-[0.73rem] text-muted-foreground">
@@ -1611,6 +1696,93 @@ onMount(() => {
 										area, then runs Codex there. The source repo root must be an external git
 										repository root, not a nested subdirectory.
 									</div>
+								</div>
+							{/if}
+						</div>
+					</div>
+				{:else if operatorRailTab === "notebook"}
+					<div class="grid min-h-0 grid-cols-[minmax(16rem,20rem)_minmax(0,1fr)]">
+						<div class="min-h-0 overflow-y-auto border-r border-border">
+							{#if !notebookPages.length}
+								<div class="px-5 py-6 text-[0.82rem] text-muted-foreground">
+									No notebook pages recorded for this run yet.
+								</div>
+							{:else}
+								{#each notebookPages as page (page.page_id)}
+									<button
+										type="button"
+										class={`grid w-full gap-2 border-b border-border px-5 py-3 text-left transition-colors ${
+											selectedNotebookPageId === page.page_id
+												? "bg-muted/40"
+												: "hover:bg-muted/20"
+										}`}
+										onclick={() => {
+											void selectNotebookPage(page.page_id);
+										}}
+									>
+										<div class="flex items-center justify-between gap-3">
+											<div class="truncate text-[0.82rem] font-medium">{page.title}</div>
+											<div class="text-[0.68rem] uppercase tracking-[0.08em] text-muted-foreground">
+												{page.kind.replaceAll("_", " ")}
+											</div>
+										</div>
+										<div class="line-clamp-2 text-[0.74rem] leading-5 text-muted-foreground">
+											{page.summary}
+										</div>
+										<div class="text-[0.68rem] text-muted-foreground">
+											{formatShortDateTime(page.recorded_at)}
+										</div>
+									</button>
+								{/each}
+							{/if}
+						</div>
+						<div class="min-h-0 overflow-y-auto px-5 py-4">
+							{#if selectedNotebookPage}
+								<div class="grid gap-4">
+									<div class="grid gap-1">
+										<div class="text-[1rem] font-medium tracking-[-0.02em]">
+											{selectedNotebookPage.record.title}
+										</div>
+										<div class="text-[0.74rem] text-muted-foreground">
+											{selectedNotebookPage.record.kind} · {formatShortDateTime(selectedNotebookPage.record.recorded_at)}
+										</div>
+									</div>
+									<pre class="whitespace-pre-wrap rounded-lg border border-border bg-background/70 p-4 text-[0.78rem] leading-6 text-foreground">{selectedNotebookPage.markdown}</pre>
+									<div class="grid gap-2 border-t border-border pt-3 text-[0.74rem] text-muted-foreground">
+										<div class="grid grid-cols-[8rem_minmax(0,1fr)] gap-3">
+											<div>Raw events</div>
+											<div>
+												{selectedNotebookPage.record.source_ref.raw_event_seq_start ?? "—"}..{selectedNotebookPage.record.source_ref.raw_event_seq_end ?? "—"}
+											</div>
+										</div>
+										<div class="grid grid-cols-[8rem_minmax(0,1fr)] gap-3">
+											<div>Workflow events</div>
+											<div>
+												{selectedNotebookPage.record.source_ref.workflow_event_seq_start ?? "—"}..{selectedNotebookPage.record.source_ref.workflow_event_seq_end ?? "—"}
+											</div>
+										</div>
+										<div class="grid grid-cols-[8rem_minmax(0,1fr)] gap-3">
+											<div>Snapshot</div>
+											<div class="break-all">
+												{selectedNotebookPage.record.source_ref.snapshot_path ?? "—"}
+											</div>
+										</div>
+										{#if Object.keys(selectedNotebookPage.record.source_ref.artifact_paths).length}
+											<div class="grid gap-2 border-t border-border pt-3">
+												<div class="text-[0.72rem] uppercase tracking-[0.08em]">Artifacts</div>
+												{#each Object.entries(selectedNotebookPage.record.source_ref.artifact_paths) as [name, path]}
+													<div class="grid grid-cols-[8rem_minmax(0,1fr)] gap-3">
+														<div>{name}</div>
+														<div class="break-all text-foreground">{path}</div>
+													</div>
+												{/each}
+											</div>
+										{/if}
+									</div>
+								</div>
+							{:else}
+								<div class="px-1 py-2 text-[0.82rem] text-muted-foreground">
+									Select a notebook page to inspect the rendered milestone record.
 								</div>
 							{/if}
 						</div>

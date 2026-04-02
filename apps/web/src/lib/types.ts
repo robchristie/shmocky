@@ -261,3 +261,52 @@ export interface WorkflowEventRecord {
 	message: string;
 	payload: unknown;
 }
+
+export interface NotebookSourceRef {
+	raw_event_seq_start: number | null;
+	raw_event_seq_end: number | null;
+	workflow_event_seq_start: number | null;
+	workflow_event_seq_end: number | null;
+	transcript_item_ids: string[];
+	artifact_paths: Record<string, string>;
+	snapshot_path: string | null;
+}
+
+export interface NotebookPageRecord {
+	sequence: number;
+	page_id: string;
+	run_id: string;
+	recorded_at: string;
+	kind:
+		| "run_started"
+		| "worktree_prepared"
+		| "plan_adopted"
+		| "execution_slice"
+		| "steering_applied"
+		| "experiment_result"
+		| "judge_decision"
+		| "oracle_blocked"
+		| "run_resumed"
+		| "run_finished"
+		| "amendment";
+	title: string;
+	summary: string;
+	why: string | null;
+	changes: string[];
+	issues: string[];
+	outcomes: string[];
+	next_steps: string[];
+	tags: string[];
+	source_ref: NotebookSourceRef;
+	amends_page_id: string | null;
+}
+
+export interface NotebookPageListResponse {
+	pages: NotebookPageRecord[];
+}
+
+export interface NotebookPageView {
+	record: NotebookPageRecord;
+	markdown: string;
+	markdown_path: string | null;
+}

@@ -21,13 +21,14 @@ Implemented:
 - pause, resume, stop, and steer controls from the browser
 - one-at-a-time Oracle consults through `POST /api/oracle/query`
 - durable per-run history snapshots with transcript and workflow activity replay
+- append-only per-run notebook pages plus rendered markdown over workflow milestones
 - websocket fanout for browser observability
 - file-backed raw event persistence before projection updates
 
 Not implemented yet:
 
 - general graph execution, multi-run scheduling, repo cloning, or browser-side workflow editing
-- multi-thread management, resume, fork, archive, or notebook projections
+- multi-thread management, resume, fork, or archive across multiple live runs
 - auth, budgets, policy gates, or multi-user tenancy
 
 ## Run
@@ -69,7 +70,8 @@ Then open the Vite URL in a browser. The header should show backend and Codex co
 and the main workspace should let you select a workflow, point it at a local git repository root,
 launch a run, inspect Codex transcript plus workflow activity, pause, resume, stop, or steer,
 respond to pending Codex approval or user-input requests from the workflow run tab, and durably
-resume an Oracle-blocked paused run after a backend restart.
+resume an Oracle-blocked paused run after a backend restart. The right rail also exposes a
+Notebook tab that renders milestone pages for the selected live or historical run.
 
 ## Workflow Config
 
@@ -124,6 +126,8 @@ The backend exposes:
 - `GET /api/workflows`
 - `GET /api/runs`
 - `GET /api/runs/{run_id}`
+- `GET /api/runs/{run_id}/notebook`
+- `GET /api/runs/{run_id}/notebook/{page_id}`
 - `POST /api/runs`
 - `GET /api/runs/active`
 - `POST /api/runs/active/pause`
@@ -132,7 +136,20 @@ The backend exposes:
 - `POST /api/runs/active/steer`
 - `POST /api/server-requests/{request_id}/resolve`
 
-The browser is the primary way to use these, but the endpoints are available for smoke tests and automation. Each run now stores a durable `dashboard-snapshot.json` under `.shmocky/runs/<run-id>/`, which the UI can reopen to restore transcript, workflow activity, and recent protocol context after the live Codex session has ended.
+The browser is the primary way to use these, but the endpoints are available for smoke tests and automation. Each run now stores a durable `dashboard-snapshot.json` under `.shmocky/runs/<run-id>/`, and notebook pages under `.shmocky/runs/<run-id>/notebook-pages.jsonl` plus rendered markdown in `.shmocky/runs/<run-id>/notebook/`.
+
+The notebook is a projection over append-only run facts, not a free-form agent diary. Canonical
+page records stay typed and machine-readable, while markdown pages are rendered from those records.
+The current notebook emits high-signal pages for milestones such as:
+
+- run start
+- managed worktree preparation
+- routed plan adoption
+- steering application
+- builder execution slices
+- judge decisions
+- Oracle blocks and resumes
+- run finish
 
 ## Oracle Sidecar
 

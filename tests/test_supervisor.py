@@ -10,7 +10,7 @@ from typing import Any, cast
 import pytest
 
 from shmocky.bridge import BridgeError, CodexAppServerBridge
-from shmocky.event_store import WorkflowEventStore
+from shmocky.notebook_models import NotebookPageListResponse
 from shmocky.models import (
     ConnectionState,
     DashboardSnapshot,
@@ -26,7 +26,7 @@ from shmocky.models import (
     WorkflowRunState,
 )
 from shmocky.settings import AppSettings
-from shmocky.supervisor import LoadedRunContext, RunResources, WorkflowSupervisor, WorkflowSupervisorError
+from shmocky.supervisor import LoadedRunContext, WorkflowSupervisor, WorkflowSupervisorError
 
 
 def _init_git_repo(path: Path) -> None:
@@ -183,13 +183,14 @@ def test_supervisor_formats_scoped_task_update_for_steering(tmp_path: Path) -> N
         pending_steering_notes=["Prioritize flaky tests.", "Do not touch UI files."],
     )
 
-    updated_prompt = supervisor._consume_steering("Continue the task.")
+    updated_prompt, applied_notes = supervisor._consume_steering("Continue the task.")
 
     assert "<task_update>" in updated_prompt
     assert "Scope: next execution turn only" in updated_prompt
     assert "- Prioritize flaky tests." in updated_prompt
     assert "- Do not touch UI files." in updated_prompt
     assert "Carry forward:" in updated_prompt
+    assert applied_notes == ["Prioritize flaky tests.", "Do not touch UI files."]
     assert supervisor._run_state.pending_steering_notes == []
 
 
@@ -369,10 +370,7 @@ def test_supervisor_debounces_snapshot_flushes_for_bursty_updates(
             oracle_cli_command="true",
         )
     )
-    supervisor._resources = RunResources(
-        run_dir=run_dir,
-        workflow_event_store=WorkflowEventStore(run_dir / "workflow-events.jsonl"),
-    )
+    supervisor._resources = supervisor._create_run_resources(run_dir)
     supervisor._run_state = WorkflowRunState(
         id="run-1",
         run_name="burst test",
@@ -915,6 +913,15 @@ judge_agent = "judge"
     assert manifest_payload["workspace"]["executionDir"] == run.execution_dir
     assert manifest_payload["workspace"]["workspaceStrategy"] == "git_worktree"
 
+    notebook = supervisor.notebook_pages(run.id)
+    assert isinstance(notebook, NotebookPageListResponse)
+    assert [page.kind for page in notebook.pages] == [
+        "worktree_prepared",
+        "run_started",
+        "run_finished",
+    ]
+    assert (tmp_path / ".shmocky" / "runs" / run.id / "notebook" / "0001-managed-worktree-prepared.md").exists()
+
 
 def test_supervisor_start_run_applies_router_selection_before_builder_starts(
     tmp_path: Path,
@@ -1042,6 +1049,12 @@ router_expert_options = ["expert"]
     assert manifest_payload["routingDecision"]["summary"] == (
         "Use the stronger builder and skip the expert hop."
     )
+    notebook = supervisor.notebook_pages(run.id)
+    assert [page.kind for page in notebook.pages[:3]] == [
+        "worktree_prepared",
+        "run_started",
+        "plan_adopted",
+    ]
 
 
 def test_supervisor_rolls_back_failed_run_start(tmp_path: Path) -> None:

@@ -18,6 +18,9 @@ from pydantic import ValidationError
 
 from .bridge import BridgeError, CodexAppServerBridge
 from .event_store import WorkflowEventStore
+from .notebook_models import NotebookPageKind, NotebookPageListResponse, NotebookPageView
+from .notebook_projection import NotebookProjection
+from .notebook_store import NotebookPageStore
 from .models import (
     AgentDefinition,
     CodexAgentConfig,
@@ -68,6 +71,7 @@ class WorkflowStoppedError(WorkflowSupervisorError):
 class RunResources:
     run_dir: Path
     workflow_event_store: WorkflowEventStore
+    notebook_projection: NotebookProjection
 
 
 @dataclass(slots=True)
@@ -94,9 +98,18 @@ class ExpertAssessmentResult:
     report: ExpertAssessment
 
 
+@dataclass(slots=True)
+class CodexTurnResult:
+    text: str
+    turn_id: str
+    transcript_item_ids: list[str]
+
+
 class WorkflowSupervisor:
     RUN_MANIFEST_FILENAME = "run.json"
     RUN_SNAPSHOT_FILENAME = "dashboard-snapshot.json"
+    RUN_NOTEBOOK_FILENAME = "notebook-pages.jsonl"
+    RUN_NOTEBOOK_DIRNAME = "notebook"
     SNAPSHOT_FLUSH_DEBOUNCE_SECONDS = 0.25
 
     def __init__(self, settings: AppSettings) -> None:
@@ -144,16 +157,24 @@ class WorkflowSupervisor:
         ):
             return
         self._run_state = workflow_run
-        self._resources = RunResources(
-            run_dir=run_dir,
-            workflow_event_store=WorkflowEventStore(run_dir / "workflow-events.jsonl"),
-        )
+        self._resources = self._create_run_resources(run_dir)
         self._recent_workflow_events.clear()
         self._recent_workflow_events.extend(
             self._load_workflow_events(run_dir / "workflow-events.jsonl")
         )
         self._archived_snapshot = snapshot
         self._pause_gate.clear()
+
+    def _create_run_resources(self, run_dir: Path) -> RunResources:
+        return RunResources(
+            run_dir=run_dir,
+            workflow_event_store=WorkflowEventStore(run_dir / "workflow-events.jsonl"),
+            notebook_projection=NotebookProjection(
+                store=NotebookPageStore(run_dir / self.RUN_NOTEBOOK_FILENAME),
+                notebook_dir=run_dir / self.RUN_NOTEBOOK_DIRNAME,
+                snapshot_path=run_dir / self.RUN_SNAPSHOT_FILENAME,
+            ),
+        )
 
     def _find_resumable_run_dir(self) -> Path | None:
         for run_dir in sorted(
@@ -345,6 +366,37 @@ class WorkflowSupervisor:
                 f"Stored snapshot for run '{run_id}' is unreadable."
             ) from exc
 
+    def notebook_pages(self, run_id: str) -> NotebookPageListResponse:
+        run_dir = self._settings.run_log_dir / run_id
+        if not run_dir.exists() or not run_dir.is_dir():
+            raise WorkflowNotFoundError(f"Unknown run '{run_id}'.")
+        notebook_path = run_dir / self.RUN_NOTEBOOK_FILENAME
+        if not notebook_path.exists():
+            return NotebookPageListResponse()
+        projection = NotebookProjection(
+            store=NotebookPageStore(notebook_path),
+            notebook_dir=run_dir / self.RUN_NOTEBOOK_DIRNAME,
+            snapshot_path=run_dir / self.RUN_SNAPSHOT_FILENAME,
+        )
+        return projection.list_pages()
+
+    def notebook_page(self, run_id: str, page_id: str) -> NotebookPageView:
+        run_dir = self._settings.run_log_dir / run_id
+        if not run_dir.exists() or not run_dir.is_dir():
+            raise WorkflowNotFoundError(f"Unknown run '{run_id}'.")
+        notebook_path = run_dir / self.RUN_NOTEBOOK_FILENAME
+        if not notebook_path.exists():
+            raise WorkflowNotFoundError(f"Unknown notebook page '{page_id}' for run '{run_id}'.")
+        projection = NotebookProjection(
+            store=NotebookPageStore(notebook_path),
+            notebook_dir=run_dir / self.RUN_NOTEBOOK_DIRNAME,
+            snapshot_path=run_dir / self.RUN_SNAPSHOT_FILENAME,
+        )
+        page = projection.load_page(page_id)
+        if page is None:
+            raise WorkflowNotFoundError(f"Unknown notebook page '{page_id}' for run '{run_id}'.")
+        return page
+
     def workflows_catalog(self) -> WorkflowCatalogResponse:
         try:
             catalog = self._loader.load()
@@ -458,10 +510,7 @@ class WorkflowSupervisor:
             workspace = self._prepare_execution_workspace(source_repo_root, run_id)
             run_dir = self._settings.run_log_dir / run_id
             run_dir.mkdir(parents=True, exist_ok=True)
-            resources = RunResources(
-                run_dir=run_dir,
-                workflow_event_store=WorkflowEventStore(run_dir / "workflow-events.jsonl"),
-            )
+            resources = self._create_run_resources(run_dir)
             self._resources = resources
             self._archived_snapshot = None
             self._recent_workflow_events.clear()
@@ -545,6 +594,36 @@ class WorkflowSupervisor:
             await self._flush_staged_snapshot_now()
             try:
                 await self._record_workflow_event(
+                    "worktree_prepared",
+                    "Prepared the managed execution worktree.",
+                    payload={
+                        "sourceRepoRoot": str(workspace.source_repo_root),
+                        "executionDir": str(workspace.execution_dir),
+                        "workspaceStrategy": workspace.workspace_strategy,
+                        "worktreeBranch": workspace.worktree_branch,
+                        "worktreeBaseCommit": workspace.worktree_base_commit,
+                    },
+                )
+                await self._append_notebook_page(
+                    kind="worktree_prepared",
+                    title="Managed worktree prepared",
+                    summary=(
+                        f"Prepared a managed {workspace.workspace_strategy} workspace at "
+                        f"{workspace.execution_dir} from {workspace.source_repo_root}."
+                    ),
+                    why=(
+                        "Runs execute in an isolated managed worktree so Shmocky can supervise "
+                        "changes without mutating the source repository directly."
+                    ),
+                    outcomes=[
+                        f"Source repo root: {workspace.source_repo_root}",
+                        f"Execution directory: {workspace.execution_dir}",
+                        f"Branch: {workspace.worktree_branch}",
+                        f"Base commit: {workspace.worktree_base_commit}",
+                    ],
+                    tags=["workspace", "git-worktree"],
+                )
+                await self._record_workflow_event(
                     "run_started",
                     (
                         "Started run "
@@ -573,6 +652,46 @@ class WorkflowSupervisor:
                         ),
                     },
                 )
+                await self._append_notebook_page(
+                    kind="run_started",
+                    title=(
+                        f"Run started: {self._run_state.run_name}"
+                        if self._run_state.run_name
+                        else f"Run started: {workflow.id}"
+                    ),
+                    summary=(
+                        f"Started workflow '{workflow.id}' against {workspace.source_repo_root}."
+                    ),
+                    why=self._run_state.goal,
+                    outcomes=[
+                        f"Workflow: {workflow.id}",
+                        f"Builder: {codex_agent.id}",
+                        f"Judge: {judge_agent.id}",
+                        (
+                            f"Expert: {expert_agent.id}"
+                            if expert_agent is not None
+                            else "Expert: none"
+                        ),
+                    ],
+                    next_steps=["Start the managed Codex builder session and execute the first slice."],
+                    tags=["run", workflow.id],
+                )
+                if self._run_state.last_routing_decision is not None:
+                    await self._append_notebook_page(
+                        kind="plan_adopted",
+                        title="Routed execution plan adopted",
+                        summary=self._run_state.last_routing_decision.summary,
+                        why="The router selected the allowed agent composition for this run.",
+                        outcomes=[
+                            f"Builder: {self._run_state.last_routing_decision.executor_agent_id}",
+                            f"Judge: {self._run_state.last_routing_decision.judge_agent_id}",
+                            (
+                                "Expert: "
+                                f"{self._run_state.last_routing_decision.expert_agent_id or 'none'}"
+                            ),
+                        ],
+                        tags=["routing", "agent-selection"],
+                    )
                 await self._start_bridge(workspace.execution_dir, codex_agent)
             except Exception:
                 await self._rollback_failed_run_start()
@@ -708,6 +827,17 @@ class WorkflowSupervisor:
                 self._run_state.updated_at = datetime.now(UTC)
                 self._pause_gate.set()
                 await self._record_workflow_event("resumed", "Workflow run resumed.")
+                await self._append_notebook_page(
+                    kind="run_resumed",
+                    title="Run resumed",
+                    summary="Resumed a previously paused workflow run.",
+                    why="Operator resume cleared the pause gate and allowed workflow execution to continue.",
+                    outcomes=[
+                        f"Status: {self._run_state.status}",
+                        f"Phase: {self._run_state.phase}",
+                    ],
+                    tags=["resume"],
+                )
             return self.snapshot()
 
     async def stop_run(self) -> DashboardSnapshot:
@@ -1029,11 +1159,38 @@ class WorkflowSupervisor:
             self._run_state.updated_at = datetime.now(UTC)
 
             await self._ensure_checkpoint("executing", f"Codex execution loop {loop_index}.")
-            execute_prompt = self._consume_steering(execute_prompt)
-            codex_output = await self._run_codex_turn(execute_prompt, kind="executing")
+            execute_prompt, applied_steering_notes = self._consume_steering(execute_prompt)
+            if applied_steering_notes:
+                await self._record_workflow_event(
+                    "steering_applied",
+                    "Applied queued operator steering to the next builder turn.",
+                    payload={"notes": applied_steering_notes},
+                )
+                await self._append_notebook_page(
+                    kind="steering_applied",
+                    title=f"Steering applied for loop {loop_index}",
+                    summary="Applied operator steering before the next builder execution slice.",
+                    why="Scoped steering overrides were queued for the next execution turn.",
+                    changes=applied_steering_notes,
+                    next_steps=["Execute the next builder slice with the scoped task update."],
+                    tags=["steering", f"loop-{loop_index}"],
+                )
+            codex_result = await self._run_codex_turn(execute_prompt, kind="executing")
+            codex_output = codex_result.text
             if self._run_state is None:
                 raise WorkflowSupervisorError("Workflow run disappeared during judging.")
             self._run_state.last_codex_output = self._clip(codex_output)
+            await self._append_notebook_page(
+                kind="execution_slice",
+                title=f"Execution slice {loop_index} completed",
+                summary=self._first_sentence(codex_output, fallback="Completed a builder execution slice."),
+                why=f"Builder loop {loop_index} executed against the current managed workspace state.",
+                changes=await self._git_stat_lines(limit=6),
+                outcomes=[f"Builder turn completed as `{codex_result.turn_id}`."],
+                next_steps=["Review expert and judge results for the next decision."],
+                tags=["builder", f"loop-{loop_index}"],
+                transcript_item_ids=codex_result.transcript_item_ids,
+            )
 
             expert_assessment: str | None = None
             expert_report: ExpertAssessment | None = None
@@ -1127,6 +1284,31 @@ class WorkflowSupervisor:
             decision.next_prompt if decision.decision == "continue" else None
         )
         self._run_state.updated_at = datetime.now(UTC)
+        next_steps: list[str] = []
+        issues: list[str] = []
+        outcomes = [f"Decision: {decision.decision}", decision.summary]
+        if decision.decision == "continue" and decision.next_prompt:
+            next_steps.append(decision.next_prompt)
+        if decision.decision == "complete" and decision.completion_note:
+            outcomes.append(decision.completion_note)
+        if decision.decision == "fail" and decision.failure_reason:
+            issues.append(decision.failure_reason)
+        await self._append_notebook_page(
+            kind="judge_decision",
+            title=f"Judge decision: {decision.decision}",
+            summary=decision.summary,
+            why="The judge evaluated the current run state, repo evidence, and optional expert input.",
+            issues=issues,
+            outcomes=outcomes,
+            next_steps=next_steps,
+            tags=["judge", decision.decision],
+            artifact_paths=self._artifact_paths(
+                "judge_request",
+                "last-judge-request.json",
+                "judge_response",
+                "last-judge-response.json",
+            ),
+        )
 
         if decision.decision == "complete":
             await self._finish_run(
@@ -1154,7 +1336,7 @@ class WorkflowSupervisor:
         *,
         kind: str,
         output_schema: dict[str, Any] | None = None,
-    ) -> str:
+    ) -> CodexTurnResult:
         if self._bridge is None:
             raise WorkflowSupervisorError("Codex session is not available.")
         await self._record_workflow_event(
@@ -1180,7 +1362,11 @@ class WorkflowSupervisor:
             raise WorkflowSupervisorError(completed.state.turn.error)
         if not assistant_text:
             raise WorkflowSupervisorError("Codex completed the turn without an assistant message.")
-        return assistant_text
+        return CodexTurnResult(
+            text=assistant_text,
+            turn_id=turn.id,
+            transcript_item_ids=self._assistant_item_ids_for_turn(completed, turn.id),
+        )
 
     async def _run_router(
         self,
@@ -1391,6 +1577,15 @@ class WorkflowSupervisor:
                 "loop": self._run_state.current_loop,
             },
         )
+        await self._append_notebook_page(
+            kind="oracle_blocked",
+            title=f"Oracle {agent_label} blocked the run",
+            summary=f"Oracle {agent_label} failed and the run paused for operator intervention.",
+            why=detail,
+            issues=[detail],
+            next_steps=["Fix the Oracle path or remote session, then resume the run."],
+            tags=["oracle", "blocked", agent_label],
+        )
         await self._broadcast_state()
         await self._flush_staged_snapshot_now()
         await self._pause_gate.wait()
@@ -1439,6 +1634,22 @@ class WorkflowSupervisor:
                 f"run_{status}",
                 note,
             )
+            await self._append_notebook_page(
+                kind="run_finished",
+                title=f"Run {status}",
+                summary=note,
+                why="The workflow reached a terminal state.",
+                issues=[note] if status == "failed" else None,
+                outcomes=[
+                    f"Status: {status}",
+                    f"Phase: {phase}",
+                    f"Loops: {self._run_state.current_loop}/{self._run_state.max_loops}",
+                    (
+                        f"Judge calls: {self._run_state.judge_calls}/{self._run_state.max_judge_calls}"
+                    ),
+                ],
+                tags=["run-finished", status],
+            )
         await self._stop_bridge()
         await self._broadcast_state()
         await self._flush_staged_snapshot_now()
@@ -1468,6 +1679,41 @@ class WorkflowSupervisor:
                 event=None,
                 workflow_event=record,
             )
+        )
+
+    async def _append_notebook_page(
+        self,
+        *,
+        kind: NotebookPageKind,
+        title: str,
+        summary: str,
+        why: str | None = None,
+        changes: list[str] | None = None,
+        issues: list[str] | None = None,
+        outcomes: list[str] | None = None,
+        next_steps: list[str] | None = None,
+        tags: list[str] | None = None,
+        transcript_item_ids: list[str] | None = None,
+        artifact_paths: dict[str, str] | None = None,
+        amends_page_id: str | None = None,
+    ) -> None:
+        if self._resources is None or self._run_state is None:
+            return
+        await self._resources.notebook_projection.append_page(
+            run_id=self._run_state.id,
+            kind=kind,
+            title=title,
+            summary=summary,
+            snapshot=self.snapshot(),
+            why=why,
+            changes=changes,
+            issues=issues,
+            outcomes=outcomes,
+            next_steps=next_steps,
+            tags=tags,
+            transcript_item_ids=transcript_item_ids,
+            artifact_paths=artifact_paths,
+            amends_page_id=amends_page_id,
         )
 
     async def _broadcast_state(self) -> None:
@@ -1609,24 +1855,48 @@ class WorkflowSupervisor:
             return stderr_text or stdout_text or "git command failed"
         return stdout_text or "(empty)"
 
-    def _consume_steering(self, prompt: str) -> str:
+    async def _git_stat_lines(self, *, limit: int = 6) -> list[str]:
+        diff_stat = await self._git_output("diff", "--stat")
+        if not diff_stat or diff_stat in {"(empty)", "git command failed", "git command timed out"}:
+            return []
+        lines = [line.strip() for line in diff_stat.splitlines() if line.strip()]
+        summary_lines = [
+            line for line in lines if not line.endswith("changed)") and "file changed" not in line
+        ]
+        return summary_lines[:limit]
+
+    def _artifact_paths(self, *pairs: str) -> dict[str, str]:
+        if self._resources is None:
+            return {}
+        iterator = iter(pairs)
+        paths: dict[str, str] = {}
+        for key, relative_path in zip(iterator, iterator, strict=False):
+            artifact_path = self._resources.run_dir / relative_path
+            if artifact_path.exists():
+                paths[key] = str(artifact_path)
+        return paths
+
+    def _consume_steering(self, prompt: str) -> tuple[str, list[str]]:
         if self._run_state is None or not self._run_state.pending_steering_notes:
-            return prompt
+            return prompt, []
         notes = [note.strip() for note in self._run_state.pending_steering_notes if note.strip()]
         self._run_state.pending_steering_notes.clear()
         self._run_state.recent_steering_notes.extend(notes)
         self._run_state.recent_steering_notes = self._run_state.recent_steering_notes[-10:]
         if not notes:
-            return prompt
+            return prompt, []
         notes_block = "\n".join(f"- {note}" for note in notes)
         return (
-            f"{prompt}\n\n<task_update>\n"
-            "Scope: next execution turn only\n"
-            "Override:\n"
-            f"{notes_block}\n"
-            "Carry forward:\n"
-            "- All earlier run instructions still apply unless they conflict with the override above.\n"
-            "</task_update>"
+            (
+                f"{prompt}\n\n<task_update>\n"
+                "Scope: next execution turn only\n"
+                "Override:\n"
+                f"{notes_block}\n"
+                "Carry forward:\n"
+                "- All earlier run instructions still apply unless they conflict with the override above.\n"
+                "</task_update>"
+            ),
+            notes,
         )
 
     def _build_routing_bundle(
@@ -1718,6 +1988,14 @@ class WorkflowSupervisor:
             if item.role == "assistant" and item.turn_id == turn_id:
                 return item.text.strip()
         return ""
+
+    @staticmethod
+    def _assistant_item_ids_for_turn(snapshot: DashboardSnapshot, turn_id: str) -> list[str]:
+        return [
+            item.item_id
+            for item in snapshot.state.transcript
+            if item.role == "assistant" and item.turn_id == turn_id
+        ]
 
     @staticmethod
     def _git_root_for(path: Path) -> Path | None:
@@ -2120,6 +2398,17 @@ class WorkflowSupervisor:
         if len(stripped) <= limit:
             return stripped
         return stripped[: limit - 1] + "…"
+
+    @classmethod
+    def _first_sentence(cls, text: str | None, *, fallback: str) -> str:
+        clipped = cls._clip(text, limit=800)
+        if not clipped:
+            return fallback
+        match = re.search(r"(.+?[.!?])(?:\s|$)", clipped, re.DOTALL)
+        if match is not None:
+            return match.group(1).strip()
+        first_line = clipped.splitlines()[0].strip()
+        return first_line or fallback
 
     @staticmethod
     def _write_json(path: Path, payload: dict[str, Any]) -> None:
